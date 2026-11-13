@@ -28,6 +28,8 @@ Preferences controls;
 bool inaReady = false, rtcReady = false, rtcTimeValid = false, luxReady = false, controlsReady = false;
 bool electricalSampleValid = false, luxSampleValid = false;
 bool lampIsOn = false, manualOn = false;
+int dayStartMinute = AutoLighting::DayStartMinute;
+int nightStartMinute = AutoLighting::NightStartMinute;
 String mode = "AUTO", appliedCommandId = "", sessionId;
 uint64_t appliedVersion = 0;
 uint32_t sequenceNumber = 0;
@@ -38,25 +40,25 @@ unsigned long lastQueueCheck = 0;
 String pendingPayload, volatilePayload, commandAck;
 char sampledAt[20] = "";
 
-#line 39 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 41 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void formatRtcTime(const DateTime& time, char (&output)[20]);
-#line 45 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 47 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void handleRtcSerial();
-#line 80 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 82 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void setLamp(bool on);
-#line 89 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 91 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void controlLamp();
-#line 97 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 100 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void readSensors();
-#line 117 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 120 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void captureTelemetry();
-#line 137 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 140 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void onRadioPacket(const String& payload);
-#line 171 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 184 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void setup();
-#line 211 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 226 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void loop();
-#line 39 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 41 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void formatRtcTime(const DateTime& time, char (&output)[20]) {
   snprintf(output, sizeof(output), "%04u-%02u-%02uT%02u:%02u:%02u",
     unsigned(time.year()), unsigned(time.month()), unsigned(time.day()),
@@ -113,7 +115,8 @@ void controlLamp() {
   const DateTime now = rtc.now();
   if (!now.isValid()) return;
   const int minutes = now.hour() * 60 + now.minute();
-  setLamp(AutoLighting::desiredState(minutes, luxSampleValid, luxValue, lampIsOn));
+  setLamp(AutoLighting::desiredState(minutes, luxSampleValid, luxValue, lampIsOn,
+    dayStartMinute, nightStartMinute));
 }
 void readSensors() {
   sampledAt[0] = '\0';
@@ -175,10 +178,20 @@ void onRadioPacket(const String& payload) {
         (newMode == "MANUAL" && command != "ON" && command != "OFF")) return;
     if (version < appliedVersion || (version == appliedVersion && !appliedCommandId.isEmpty() && id != appliedCommandId)) return;
     if (id != appliedCommandId) {
+      JsonVariantConst schedule = data["autoSchedule"].as<JsonVariantConst>();
+      int day = schedule["dayStartMinute"] | -1;
+      int night = schedule["nightStartMinute"] | -1;
+      if (!schedule.isNull() && (day < 0 || day >= 1440 || night < 0 || night >= 1440 || day == night)) return;
+      if (schedule.isNull()) {
+        data["autoSchedule"]["dayStartMinute"] = dayStartMinute;
+        data["autoSchedule"]["nightStartMinute"] = nightStartMinute;
+      }
       String saved; serializeJson(data, saved);
       if (!controlsReady || controls.putString("command", saved) != saved.length()) {
         Serial.println("ERROR: cannot persist command; no command ACK"); return;
       }
+      dayStartMinute = data["autoSchedule"]["dayStartMinute"] | AutoLighting::DayStartMinute;
+      nightStartMinute = data["autoSchedule"]["nightStartMinute"] | AutoLighting::NightStartMinute;
       mode = newMode; manualOn = command == "ON"; appliedCommandId = id; appliedVersion = version;
       controlLamp();
       Serial.printf("LoRa command applied: %s %s\n", mode.c_str(), command.c_str());
@@ -204,6 +217,8 @@ void setup() {
       if (restored == "AUTO" || restored == "MANUAL") {
         mode = restored; manualOn = String(saved["command"] | "") == "ON";
         appliedCommandId = saved["commandId"] | ""; appliedVersion = saved["version"] | uint64_t(0);
+        dayStartMinute = saved["autoSchedule"]["dayStartMinute"] | AutoLighting::DayStartMinute;
+        nightStartMinute = saved["autoSchedule"]["nightStartMinute"] | AutoLighting::NightStartMinute;
       }
     }
   }

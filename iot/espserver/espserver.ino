@@ -5,13 +5,11 @@
 #include "RadioLink.h"
 #include "src/PubSubClient/PubSubClient.h"
 
-// Must match Mqtt:Gateways in server/appsettings.json.
-const char* GATEWAY_ID = "LUXMAP-GW001";
-const char* NODE_ID = "LUXMAP-P001";
 WiFiClient mqttNetwork;
 PubSubClient mqtt(mqttNetwork);
 RadioLink radio;
 String activeBroker, mqttHost;
+unsigned long activeConfigVersion = 0;
 uint16_t brokerPort = 1883;
 String desiredCommand, desiredCommandId, acknowledgedCommandId, telemetryAck, nodeCommandAck;
 uint64_t desiredVersion = 0;
@@ -22,10 +20,10 @@ unsigned long commandRetryDelay = COMMAND_RETRY_MIN_MS;
 const unsigned long HEARTBEAT_INTERVAL_MS = 10000;
 unsigned long lastHeartbeat = 0;
 
-String topic(const char* kind) { return String("luxmap/") + NODE_ID + "/" + kind; }
+String topic(const char* kind) { return String("luxmap/") + nodeId + "/" + kind; }
 void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
   JsonDocument data;
-  if (deserializeJson(data, payload, length) || String(data["deviceId"] | "") != NODE_ID) return;
+  if (deserializeJson(data, payload, length) || String(data["deviceId"] | "") != nodeId) return;
   if (topic("telemetryAck") == incomingTopic && String(data["kind"] | "") == "telemetryAck") {
     telemetryAck = ""; serializeJson(data, telemetryAck);
   } else if (topic("command") == incomingTopic && String(data["kind"] | "") == "command") {
@@ -43,7 +41,7 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
 }
 void onRadioPacket(const String& payload) {
   JsonDocument data;
-  if (deserializeJson(data, payload) || String(data["deviceId"] | "") != NODE_ID) return;
+  if (deserializeJson(data, payload) || String(data["deviceId"] | "") != nodeId) return;
   String kind = data["kind"] | "";
   if (kind == "telemetry") {
     // No local ACK. Only the backend's durable-storage ACK is relayed to the node.
@@ -57,12 +55,14 @@ void onRadioPacket(const String& payload) {
   }
 }
 void maintainMqtt() {
-  if (networkApplyPending || WiFi.status() != WL_CONNECTED || configuredBroker.isEmpty()) {
+  if (networkApplyPending || WiFi.status() != WL_CONNECTED || configuredBroker.isEmpty() ||
+      !validMqttId(gatewayId) || !validMqttId(nodeId) || mqttUsername != gatewayId || !validMqttSecret(mqttSecret)) {
     if (mqtt.connected()) mqtt.disconnect();
     mqttNetwork.stop(); return;
   }
-  if (activeBroker != configuredBroker) {
+  if (activeBroker != configuredBroker || activeConfigVersion != configVersion) {
     mqtt.disconnect(); mqttNetwork.stop(); activeBroker = configuredBroker;
+    activeConfigVersion = configVersion;
     String address = activeBroker.substring(7); int colon = address.indexOf(':');
     mqttHost = colon < 0 ? address : address.substring(0, colon);
     brokerPort = colon < 0 ? 1883 : address.substring(colon + 1).toInt();
@@ -74,7 +74,8 @@ void maintainMqtt() {
   if (!mqtt.connected()) {
     if (millis() - lastMqttAttempt < 5000) return;
     lastMqttAttempt = millis();
-    if (!mqttNetwork.connect(mqttHost.c_str(), brokerPort, 1000) || !mqtt.connect(GATEWAY_ID)) {
+    if (!mqttNetwork.connect(mqttHost.c_str(), brokerPort, 1000) ||
+        !mqtt.connect(gatewayId.c_str(), mqttUsername.c_str(), mqttSecret.c_str())) {
       mqttNetwork.stop(); Serial.printf("MQTT failed state=%d\n", mqtt.state()); return;
     }
     if (!mqtt.subscribe(topic("command").c_str(), 1) || !mqtt.subscribe(topic("telemetryAck").c_str(), 1)) {
@@ -87,7 +88,7 @@ void maintainMqtt() {
   if (!mqtt.loop()) return;
   const unsigned long now = millis();
   if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
-    const String heartbeatTopic = String("luxmap/gateways/") + GATEWAY_ID + "/heartbeat";
+    const String heartbeatTopic = String("luxmap/gateways/") + gatewayId + "/heartbeat";
     if (mqtt.publish(heartbeatTopic.c_str(), "1", false)) lastHeartbeat = now;
   }
 }
@@ -97,7 +98,7 @@ void setup() {
   mqtt.setCallback(onMqttMessage); mqtt.setKeepAlive(15); mqtt.setSocketTimeout(1);
   if (!mqtt.setBufferSize(1536)) Serial.println("ERROR: MQTT buffer allocation failed");
   startNetworkConfiguration();
-  Serial.printf("LuxMap LoRa gateway %s, node %s\n", GATEWAY_ID, NODE_ID);
+  Serial.printf("LuxMap LoRa gateway %s, node %s\n", gatewayId.c_str(), nodeId.c_str());
 }
 void loop() {
   // Service UART before network work; retries are bounded, no reconnect while-loop.

@@ -4,13 +4,16 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <esp_system.h>
 
 // Built into the Arduino ESP32 core; no WiFiManager library required.
-const char* CONFIG_PASSWORD = "luxmap123";
+String configPassword;
 WebServer configWeb(80);
 String configuredSsid;
 String configuredPassword;
 String configuredBroker;
+String gatewayId, nodeId, mqttUsername, mqttSecret;
+unsigned long configVersion = 0;
 bool networkApplyPending = false;
 unsigned long networkSavedAt = 0;
 
@@ -24,7 +27,11 @@ String escapeConfigHtml(String value) {
 }
 
 bool authorizeConfiguration() {
-  if (configWeb.authenticate("admin", CONFIG_PASSWORD)) return true;
+  if (configWeb.client().localIP() != WiFi.softAPIP()) {
+    configWeb.send(403, "text/plain", "Connect to the gateway setup Wi-Fi.");
+    return false;
+  }
+  if (configWeb.authenticate("admin", configPassword.c_str())) return true;
   configWeb.requestAuthentication();
   return false;
 }
@@ -51,6 +58,14 @@ button{background:#145ac8;color:white;border:0;border-radius:8px;margin-top:24px
 <label>Địa chỉ MQTT broker<input name="server" type="text" maxlength="200" required placeholder="mqtt://192.168.1.20:1883" value=")HTML";
   page += escapeConfigHtml(configuredBroker);
   page += R"HTML("></label><small>Nhập mqtt://IP:1883, không thêm /api. Không dùng localhost.</small>
+<label>Gateway ID<input name="gateway" maxlength="64" required value=")HTML";
+  page += escapeConfigHtml(gatewayId);
+  page += R"HTML("></label><label>Node ID<input name="node" maxlength="64" required value=")HTML";
+  page += escapeConfigHtml(nodeId);
+  page += R"HTML("></label><label>MQTT username<input name="user" maxlength="64" required value=")HTML";
+  page += escapeConfigHtml(mqttUsername);
+  page += R"HTML("></label><label>MQTT secret<input name="secret" type="password" maxlength="64" autocomplete="new-password"></label>
+<small>Để trống để giữ secret nếu broker, Gateway ID và username giữ nguyên.</small>
 <button>Lưu và kết nối</button></form><p>Cấu hình vẫn được giữ sau khi tắt nguồn.</p></main></body></html>)HTML";
   configWeb.sendHeader("Cache-Control", "no-store");
   configWeb.send(200, "text/html; charset=utf-8", page);
@@ -80,6 +95,20 @@ bool validBrokerAddress(const String& address) {
   return true;
 }
 
+bool validMqttId(const String& id) {
+  if (id.isEmpty() || id.length() > 64 || !isalnum(static_cast<unsigned char>(id[0]))) return false;
+  for (unsigned int i = 0; i < id.length(); ++i)
+    if (!isalnum(static_cast<unsigned char>(id[i])) && id[i] != '-' && id[i] != '_') return false;
+  return true;
+}
+
+bool validMqttSecret(const String& secret) {
+  if (secret.length() != 64) return false;
+  for (unsigned int i = 0; i < secret.length(); ++i)
+    if (!isxdigit(static_cast<unsigned char>(secret[i]))) return false;
+  return true;
+}
+
 void saveNetworkConfiguration() {
   if (!authorizeConfiguration()) return;
   String ssid = configWeb.arg("ssid");
@@ -87,6 +116,17 @@ void saveNetworkConfiguration() {
   String server = configWeb.arg("server");
   server.trim();
   while (server.endsWith("/")) server.remove(server.length() - 1);
+  String gateway = configWeb.arg("gateway");
+  String node = configWeb.arg("node");
+  String user = configWeb.arg("user");
+  String secret = configWeb.arg("secret");
+  if (secret.isEmpty() && server == configuredBroker && gateway == gatewayId && user == mqttUsername)
+    secret = mqttSecret;
+  if (!validMqttId(gateway) || !validMqttId(node) || user != gateway || !validMqttSecret(secret)) {
+    configWeb.send(400, "text/plain; charset=utf-8",
+      "Cần Gateway ID, Node ID, username trùng Gateway ID và secret MQTT 64 ký tự hex.");
+    return;
+  }
   bool openNetwork = configWeb.arg("open") == "1";
   if (!openNetwork && password.isEmpty() && ssid == configuredSsid)
     password = configuredPassword;
@@ -103,6 +143,10 @@ void saveNetworkConfiguration() {
   config["ssid"] = ssid;
   config["password"] = password;
   config["broker"] = server;
+  config["gateway"] = gateway;
+  config["node"] = node;
+  config["mqtt_user"] = user;
+  config["mqtt_secret"] = secret;
   String encoded;
   serializeJson(config, encoded);
   Preferences storage;
@@ -120,6 +164,11 @@ void saveNetworkConfiguration() {
   configuredSsid = ssid;
   configuredPassword = password;
   configuredBroker = server;
+  gatewayId = gateway;
+  nodeId = node;
+  mqttUsername = user;
+  mqttSecret = secret;
+  ++configVersion;
   networkSavedAt = millis();
   networkApplyPending = true;
   configWeb.sendHeader("Cache-Control", "no-store");
@@ -140,6 +189,10 @@ void startNetworkConfiguration() {
       configuredSsid = config["ssid"] | "";
       configuredPassword = config["password"] | "";
       configuredBroker = config["broker"] | "";
+      gatewayId = config["gateway"] | "";
+      nodeId = config["node"] | "";
+      mqttUsername = config["mqtt_user"] | "";
+      mqttSecret = config["mqtt_secret"] | "";
       if (configuredBroker.isEmpty()) {
         String previous = config["server"] | "";
         if (previous.startsWith("http://")) {
@@ -154,9 +207,24 @@ void startNetworkConfiguration() {
   }
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(true);
+  if (storage.begin("luxmap-net", false)) {
+    configPassword = storage.getString("setup_pw", "");
+    if (configPassword.length() != 16) {
+      char generated[17];
+      snprintf(generated, sizeof(generated), "%08lx%08lx",
+        static_cast<unsigned long>(esp_random()), static_cast<unsigned long>(esp_random()));
+      if (storage.putString("setup_pw", generated) == 16) configPassword = generated;
+    }
+    storage.end();
+  }
+  if (configPassword.length() != 16) {
+    Serial.println("ERROR: cannot store gateway setup password");
+    if (!configuredSsid.isEmpty()) WiFi.begin(configuredSsid.c_str(), configuredPassword.c_str());
+    return;
+  }
   String apName = String("LUXMAP-GATEWAY-") + WiFi.macAddress().substring(12);
   apName.replace(":", "");
-  if (!WiFi.softAP(apName.c_str(), CONFIG_PASSWORD))
+  if (!WiFi.softAP(apName.c_str(), configPassword.c_str()))
     Serial.println("ERROR: cannot start configuration WiFi");
   configWeb.on("/", HTTP_GET, showNetworkConfiguration);
   configWeb.on("/save", HTTP_POST, saveNetworkConfiguration);
@@ -164,7 +232,7 @@ void startNetworkConfiguration() {
   configWeb.begin();
   Serial.print("Configuration WiFi: "); Serial.println(apName);
   Serial.print("Configuration page: http://"); Serial.println(WiFi.softAPIP());
-  Serial.println("WiFi password: luxmap123; page login: admin / luxmap123");
+  Serial.printf("Setup Wi-Fi and admin password: %s\n", configPassword.c_str());
   if (!configuredSsid.isEmpty())
     WiFi.begin(configuredSsid.c_str(), configuredPassword.c_str());
 }
