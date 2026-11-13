@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..,..\\..,..\\..,..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "C:\\Users\\Nguyen Tien Dat\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.11,C:\\Users\\Nguyen Tien Dat\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.11",
+  "otherLibrariesFolders": "C:\\Arduino\\libraries,C:\\Users\\Nguyen Tien Dat\\OneDrive - Đại học FPT- FPT University\\Documents\\Arduino\\libraries",
+  "sketchLocation": "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode"
+}
