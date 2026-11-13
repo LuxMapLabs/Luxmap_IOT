@@ -54,9 +54,9 @@ void readSensors();
 void captureTelemetry();
 #line 140 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void onRadioPacket(const String& payload);
-#line 184 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 197 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void setup();
-#line 226 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
+#line 239 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void loop();
 #line 41 "E:\\Ki9\\DoAn\\iot\\code iot\\iot\\espnode\\espnode.ino"
 void formatRtcTime(const DateTime& time, char (&output)[20]) {
@@ -178,6 +178,19 @@ void onRadioPacket(const String& payload) {
         (newMode == "MANUAL" && command != "ON" && command != "OFF")) return;
     if (version < appliedVersion || (version == appliedVersion && !appliedCommandId.isEmpty() && id != appliedCommandId)) return;
     if (id != appliedCommandId) {
+      if (!data["expiresAtUnixSeconds"].isNull()) {
+        if (!rtcTimeValid) {
+          Serial.println("LoRa command skipped: RTC unavailable");
+          return;
+        }
+        const DateTime now = rtc.now();
+        // DS3231 stores Vietnam local time; bridge expiry uses UTC Unix seconds.
+        const int64_t expiresAt = data["expiresAtUnixSeconds"] | int64_t(0);
+        if (!now.isValid() || expiresAt <= int64_t(now.unixtime()) - 7 * 3600) {
+          Serial.println("LoRa command skipped: expired or RTC unavailable");
+          return;
+        }
+      }
       JsonVariantConst schedule = data["autoSchedule"].as<JsonVariantConst>();
       int day = schedule["dayStartMinute"] | -1;
       int night = schedule["nightStartMinute"] | -1;
