@@ -5,13 +5,30 @@ constexpr int DayStartMinute = 6 * 60;
 constexpr int NightStartMinute = 18 * 60 + 1;
 constexpr float ThresholdLux = 50.0f;
 
-constexpr bool desiredState(int minuteOfDay, bool hasLuxSample, float lux, bool currentState,
-    int dayStart = DayStartMinute, int nightStart = NightStartMinute) {
-  const bool inDay = dayStart < nightStart
+constexpr int RequiredSamples = 5;
+
+constexpr bool isDay(int minuteOfDay, int dayStart, int nightStart) {
+  return dayStart < nightStart
     ? minuteOfDay >= dayStart && minuteOfDay < nightStart
     : minuteOfDay >= dayStart || minuteOfDay < nightStart;
-  if (!inDay) return true;
-  if (!hasLuxSample || lux == ThresholdLux) return currentState;
-  return lux < ThresholdLux;
 }
+
+class ConsecutiveSamples {
+ public:
+  void reset() { count = 0; }
+  int pendingSamples() const { return count; }
+
+  bool update(bool valid, float lux, bool lampOn) {
+    if (!valid || lux == ThresholdLux || (lux < ThresholdLux) == lampOn) {
+      reset();
+      return lampOn;
+    }
+    if (++count < RequiredSamples) return lampOn;
+    reset();
+    return !lampOn;
+  }
+
+ private:
+  int count = 0;
+};
 }

@@ -12,7 +12,7 @@ WebServer configWeb(80);
 String configuredSsid;
 String configuredPassword;
 String configuredBroker;
-String gatewayId, nodeId, mqttUsername, mqttSecret;
+String gatewayId, mqttUsername, mqttSecret;
 unsigned long configVersion = 0;
 bool networkApplyPending = false;
 unsigned long networkSavedAt = 0;
@@ -55,13 +55,11 @@ button{background:#145ac8;color:white;border:0;border-radius:8px;margin-top:24px
   page += R"HTML("></label><label>Mật khẩu Wi-Fi<input name="password" type="password" maxlength="63" autocomplete="new-password"></label>
 <small>Để trống để giữ mật khẩu đã lưu. Nếu đổi Wi-Fi, nhập mật khẩu mới.</small>
 <label><input style="width:auto" type="checkbox" name="open" value="1"> Mạng Wi-Fi không có mật khẩu</label>
-<label>Địa chỉ MQTT broker<input name="server" type="text" maxlength="200" required placeholder="mqtt://192.168.1.20:1883" value=")HTML";
+<label>Địa chỉ MQTT broker<input name="server" type="text" maxlength="200" required placeholder="mqtts://luxmap.com.vn:8883" value=")HTML";
   page += escapeConfigHtml(configuredBroker);
-  page += R"HTML("></label><small>Nhập mqtt://IP:1883, không thêm /api. Không dùng localhost.</small>
+  page += R"HTML("></label><small>Nhập mqtts://luxmap.com.vn:8883, không thêm /api.</small>
 <label>Gateway ID<input name="gateway" maxlength="64" required value=")HTML";
   page += escapeConfigHtml(gatewayId);
-  page += R"HTML("></label><label>Node ID<input name="node" maxlength="64" required value=")HTML";
-  page += escapeConfigHtml(nodeId);
   page += R"HTML("></label><label>MQTT username<input name="user" maxlength="64" required value=")HTML";
   page += escapeConfigHtml(mqttUsername);
   page += R"HTML("></label><label>MQTT secret<input name="secret" type="password" maxlength="64" autocomplete="new-password"></label>
@@ -72,9 +70,9 @@ button{background:#145ac8;color:white;border:0;border-radius:8px;margin-top:24px
 }
 
 bool validBrokerAddress(const String& address) {
-  // LAN MQTT uses TCP without TLS. Reject credentials, paths and ambiguous URLs.
-  if (!address.startsWith("mqtt://") || address.length() > 200) return false;
-  String authority = address.substring(7);
+  // MQTT requires TLS. Reject credentials, paths and ambiguous URLs.
+  if (!address.startsWith("mqtts://") || address.length() > 200) return false;
+  String authority = address.substring(8);
   if (authority.isEmpty() || authority.indexOf('/') >= 0 || authority.indexOf('@') >= 0 ||
       authority.indexOf('?') >= 0 || authority.indexOf('#') >= 0) return false;
   int separator = authority.indexOf(':');
@@ -117,14 +115,13 @@ void saveNetworkConfiguration() {
   server.trim();
   while (server.endsWith("/")) server.remove(server.length() - 1);
   String gateway = configWeb.arg("gateway");
-  String node = configWeb.arg("node");
   String user = configWeb.arg("user");
   String secret = configWeb.arg("secret");
   if (secret.isEmpty() && server == configuredBroker && gateway == gatewayId && user == mqttUsername)
     secret = mqttSecret;
-  if (!validMqttId(gateway) || !validMqttId(node) || user != gateway || !validMqttSecret(secret)) {
+  if (!validMqttId(gateway) || user != gateway || !validMqttSecret(secret)) {
     configWeb.send(400, "text/plain; charset=utf-8",
-      "Cần Gateway ID, Node ID, username trùng Gateway ID và secret MQTT 64 ký tự hex.");
+      "Cần Gateway ID, username trùng Gateway ID và secret MQTT 64 ký tự hex.");
     return;
   }
   bool openNetwork = configWeb.arg("open") == "1";
@@ -136,7 +133,7 @@ void saveNetworkConfiguration() {
       !validBrokerAddress(server)) {
     configWeb.send(400, "text/plain; charset=utf-8",
       "Thông tin không hợp lệ. SSID tối đa 32 byte, mật khẩu 8-63 byte (hoặc chọn mạng mở). "
-      "Server dạng mqtt://IP:1883 hoặc mqtt://hostname:1883, không thêm /api. Quay lại để sửa.");
+      "Server dạng mqtts://luxmap.com.vn:8883, không thêm /api. Quay lại để sửa.");
     return;
   }
   JsonDocument config;
@@ -144,7 +141,6 @@ void saveNetworkConfiguration() {
   config["password"] = password;
   config["broker"] = server;
   config["gateway"] = gateway;
-  config["node"] = node;
   config["mqtt_user"] = user;
   config["mqtt_secret"] = secret;
   String encoded;
@@ -165,7 +161,6 @@ void saveNetworkConfiguration() {
   configuredPassword = password;
   configuredBroker = server;
   gatewayId = gateway;
-  nodeId = node;
   mqttUsername = user;
   mqttSecret = secret;
   ++configVersion;
@@ -190,19 +185,9 @@ void startNetworkConfiguration() {
       configuredPassword = config["password"] | "";
       configuredBroker = config["broker"] | "";
       gatewayId = config["gateway"] | "";
-      nodeId = config["node"] | "";
       mqttUsername = config["mqtt_user"] | "";
       mqttSecret = config["mqtt_secret"] | "";
-      if (configuredBroker.isEmpty()) {
-        String previous = config["server"] | "";
-        if (previous.startsWith("http://")) {
-          String host = previous.substring(7);
-          int colon = host.indexOf(':' );
-          if (colon >= 0) host = host.substring(0, colon);
-          configuredBroker = String("mqtt://") + host + ":1883";
-        }
-      }
-      if (!validBrokerAddress(configuredBroker)) configuredBroker = "";
+      // Keep the old address in the form so changing broker still requires its secret.
     }
   }
   WiFi.mode(WIFI_AP_STA);

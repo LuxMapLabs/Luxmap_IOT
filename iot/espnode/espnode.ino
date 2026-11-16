@@ -88,14 +88,25 @@ void setLamp(bool on) {
   }
   lampIsOn = on;
 }
-void controlLamp() {
-  if (mode == "MANUAL") { setLamp(manualOn); return; }
-  if (!rtcTimeValid) return;
+AutoLighting::ConsecutiveSamples autoSamples;
+
+void controlLamp(bool freshSample) {
+  if (mode == "MANUAL") { autoSamples.reset(); setLamp(manualOn); return; }
+  if (!rtcTimeValid) { autoSamples.reset(); return; }
   const DateTime now = rtc.now();
-  if (!now.isValid()) return;
+  if (!now.isValid()) { autoSamples.reset(); return; }
   const int minutes = now.hour() * 60 + now.minute();
-  setLamp(AutoLighting::desiredState(minutes, luxSampleValid, luxValue, lampIsOn,
-    dayStartMinute, nightStartMinute));
+  if (!AutoLighting::isDay(minutes, dayStartMinute, nightStartMinute)) {
+    autoSamples.reset();
+    setLamp(true);
+  } else if (freshSample) {
+    const bool nextState = autoSamples.update(luxSampleValid, luxValue, lampIsOn);
+    const int streak = nextState != lampIsOn ? AutoLighting::RequiredSamples : autoSamples.pendingSamples();
+    if (streak > 0)
+      Serial.printf("AUTO lux=%.2f target=%s samples=%d/%d\n",
+        luxValue, lampIsOn ? "OFF" : "ON", streak, AutoLighting::RequiredSamples);
+    setLamp(nextState);
+  }
 }
 void readSensors() {
   sampledAt[0] = '\0';
@@ -185,7 +196,8 @@ void onRadioPacket(const String& payload) {
       dayStartMinute = data["autoSchedule"]["dayStartMinute"] | AutoLighting::DayStartMinute;
       nightStartMinute = data["autoSchedule"]["nightStartMinute"] | AutoLighting::NightStartMinute;
       mode = newMode; manualOn = command == "ON"; appliedCommandId = id; appliedVersion = version;
-      controlLamp();
+      autoSamples.reset();
+      controlLamp(false);
       Serial.printf("LoRa command applied: %s %s\n", mode.c_str(), command.c_str());
     }
     JsonDocument ack;
@@ -232,15 +244,19 @@ void setup() {
     inaReady ? "ready" : "not found/configuration failed", INA226_ADDRESS, INA226_SHUNT_OHMS);
   luxReady = lightSensor.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
   Serial.println(outbox.begin(sessionId) ? "MicroSD outbox ready" : "ERROR: MicroSD unavailable");
-  radio.begin(onRadioPacket); delay(200); readSensors(); controlLamp(); captureTelemetry();
-  lastSample = millis(); lastTransmit = millis() - RETRY_INTERVAL;
+  radio.begin(onRadioPacket); delay(200); readSensors(); controlLamp(true); captureTelemetry();
+  lastSensor = lastSample = millis(); lastTransmit = millis() - RETRY_INTERVAL;
   Serial.printf("LuxMap node %s session=%s\n", DEVICE_ID, sessionId.c_str());
 }
 void loop() {
   radio.poll();
+  if (!radio.busy() && !commandAck.isEmpty() && radio.sendJson(commandAck, true)) {
+    commandAck = "";
+    radio.poll();
+  }
   handleRtcSerial();
   unsigned long now = millis();
-  if (now - lastSensor >= SENSOR_INTERVAL) { lastSensor = now; readSensors(); controlLamp(); }
+  if (now - lastSensor >= SENSOR_INTERVAL) { lastSensor = now; readSensors(); controlLamp(true); }
   if (now - lastSample >= SAMPLE_INTERVAL) {
     lastSample = now;
     if (!volatilePayload.isEmpty() && pendingPayload != volatilePayload && outbox.append(volatilePayload)) {
@@ -249,9 +265,7 @@ void loop() {
     }
     captureTelemetry();
   }
-  if (!radio.busy() && !commandAck.isEmpty()) {
-    if (radio.sendJson(commandAck, true)) commandAck = "";
-  } else if (!radio.busy() && now - lastTransmit >= retryDelay) {
+  if (!radio.busy() && commandAck.isEmpty() && now - lastTransmit >= retryDelay) {
     if (pendingPayload.isEmpty() && now - lastQueueCheck >= 1000) {
       lastQueueCheck = now;
       if (!outbox.peek(pendingPayload)) pendingPayload = volatilePayload;

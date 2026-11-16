@@ -66,7 +66,7 @@ api.MapPost("/{deviceId}/command", async (string deviceId, CommandRequest reques
     catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
 }).WithSummary("Điều khiển đèn: ON / OFF / AUTO")
   .WithDescription("Nhập deviceId LUXMAP-P001, chọn ví dụ ON, OFF hoặc AUTO, bấm Try it out và Execute. " +
-      "MANUAL giữ trạng thái bật/tắt. AUTO từ 06:00 đến hết 18:00: dưới 50 lux bật, trên 50 lux tắt sau một mẫu; " +
+      "MANUAL giữ trạng thái bật/tắt. Trong khung giờ dùng cảm biến (mặc định 06:00 đến hết 18:00), AUTO cần 5 mẫu liên tiếp dưới 50 lux để bật hoặc trên 50 lux để tắt; " +
       "đúng 50 lux giữ trạng thái. Từ 18:01 đến 05:59, AUTO luôn bật.")
   .Produces<LampCommand>().Produces(400);
 
