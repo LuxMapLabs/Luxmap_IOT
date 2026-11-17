@@ -46,6 +46,14 @@ bool heartbeatSent = false, nodeListReceived = false;
 String topic(const String& id, const char* kind) { return String("luxmap/") + id + "/" + kind; }
 String gatewayTopic(const char* kind) { return String("luxmap/gateways/") + gatewayId + "/" + kind; }
 
+void logTelemetry(const char* stage, const JsonDocument& data) {
+  const char* deviceId = data["deviceId"] | "";
+  const char* sessionId = data["sessionId"] | "";
+  Serial.printf("Telemetry %s device=%s session=%s seq=%lu\n", stage,
+    validMqttId(deviceId) ? deviceId : "-", validMqttId(sessionId) ? sessionId : "-",
+    data["sequenceNumber"] | 0UL);
+}
+
 NodeState* findNode(const String& id);
 NodeState* findNode(const String& id) {
   for (auto& node : nodes)
@@ -119,6 +127,7 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
   auto* node = findNode(data["deviceId"] | "");
   if (!node) return;
   if (topic(node->id, "telemetryAck") == incomingTopic && String(data["kind"] | "") == "telemetryAck") {
+    logTelemetry("MQTT ACK received", data);
     node->telemetryAck = "";
     serializeJson(data, node->telemetryAck);
   } else if (topic(node->id, "command") == incomingTopic && String(data["kind"] | "") == "command") {
@@ -145,15 +154,27 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
 
 void onRadioPacket(const String& payload) {
   JsonDocument data;
-  if (deserializeJson(data, payload)) return;
-  auto* node = findNode(data["deviceId"] | "");
-  if (!node) return;
+  if (deserializeJson(data, payload)) {
+    Serial.println("LoRa frame rejected: invalid JSON");
+    return;
+  }
   const String kind = data["kind"] | "";
+  if (kind == "telemetry") logTelemetry("LoRa received", data);
+  auto* node = findNode(data["deviceId"] | "");
+  if (!node) {
+    if (kind == "telemetry") logTelemetry("blocked: device not in gateway list", data);
+    return;
+  }
   if (kind == "telemetry") {
     // Only the bridge's durable-storage ACK is relayed to the node.
-    if (mqtt.connected() && nodeListReceived && mqtt.publish(topic(node->id, "telemetry").c_str(), payload.c_str(), false))
-      Serial.printf("LoRa telemetry forwarded from %s; awaiting server ACK\n", node->id.c_str());
-    else Serial.println("MQTT unavailable: node retains SD record and will retry");
+    if (!mqtt.connected())
+      logTelemetry("blocked: MQTT disconnected", data);
+    else if (!nodeListReceived)
+      logTelemetry("blocked: MQTT node list not synced", data);
+    else if (mqtt.publish(topic(node->id, "telemetry").c_str(), payload.c_str(), false))
+      logTelemetry("MQTT published", data);
+    else
+      logTelemetry("MQTT publish failed", data);
   } else if (kind == "commandAck" && !node->desiredCommandId.isEmpty() &&
              String(data["commandId"] | "") == node->desiredCommandId) {
     node->acknowledgedCommandId = node->desiredCommandId;
@@ -251,6 +272,7 @@ void maintainMqtt() {
 }
 void setup() {
   Serial.begin(115200);
+  Serial.println("Gateway firmware: telemetry diagnostics enabled");
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
       Serial.printf("Wi-Fi disconnected reason=%u\n", static_cast<unsigned int>(info.wifi_sta_disconnected.reason));
@@ -285,6 +307,7 @@ bool sendTelemetryAck() {
     auto& node = nodes[index];
     if (node.telemetryAck.isEmpty()) continue;
     if (!radio.sendJson(node.telemetryAck)) return false;
+    Serial.printf("Telemetry LoRa ACK queued device=%s\n", node.id.c_str());
     node.telemetryAck = "";
     radioCursor = (index + 1) % nodes.size();
     commandsSinceTelemetryAck = 0;
@@ -315,6 +338,19 @@ void sendPendingRadio() {
   sendTelemetryAck();
 }
 
+void reportRadioReceive() {
+  static unsigned long previousReport = 0;
+  static uint32_t previousBytes = 0;
+  const auto now = millis();
+  if (now - previousReport < 10000) return;
+  const uint32_t bytes = radio.rxByteCount();
+  Serial.printf("LoRa UART RX: +%lu bytes in %lu ms; MQTT state=%d; node list=%s (%u)\n",
+    static_cast<unsigned long>(bytes - previousBytes), now - previousReport,
+    mqtt.state(), nodeListReceived ? "synced" : "pending", static_cast<unsigned>(nodes.size()));
+  previousReport = now;
+  previousBytes = bytes;
+}
+
 void loop() {
   // Service UART before network work; retries are bounded, no reconnect while-loop.
   radio.poll();
@@ -322,5 +358,6 @@ void loop() {
   maintainMqtt();
   publishCommandAck();
   sendPendingRadio();
+  reportRadioReceive();
   delay(2);
 }

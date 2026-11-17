@@ -13,7 +13,7 @@
 
 const char* DEVICE_ID = "LUXMAP-P001";
 const int RELAY_PIN = 27;
-const int RELAY_ON_LEVEL = LOW, RELAY_OFF_LEVEL = HIGH;
+const int RELAY_ON_LEVEL = HIGH, RELAY_OFF_LEVEL = LOW;
 const unsigned long SENSOR_INTERVAL = 1000, SAMPLE_INTERVAL = 10000, RETRY_INTERVAL = 10000;
 constexpr uint8_t INA226_ADDRESS = 0x40;
 constexpr float INA226_SHUNT_OHMS = 0.002f; // R002 on this module.
@@ -80,11 +80,12 @@ void handleRtcSerial() {
 }
 
 void setLamp(bool on) {
-  digitalWrite(RELAY_PIN, on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL);
+  const int level = on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL;
+  digitalWrite(RELAY_PIN, level);
   if (on != lampIsOn) {
     // The electrical sample belongs to the previous relay state.
     electricalSampleValid = false;
-    Serial.printf("Lamp %s, GPIO27=%s\n", on ? "ON" : "OFF", on ? "LOW" : "HIGH");
+    Serial.printf("Lamp %s, GPIO%d=%s\n", on ? "ON" : "OFF", RELAY_PIN, level == HIGH ? "HIGH" : "LOW");
   }
   lampIsOn = on;
 }
@@ -158,7 +159,8 @@ void onRadioPacket(const String& payload) {
         data["sequenceNumber"].as<uint32_t>() != pending["sequenceNumber"].as<uint32_t>()) return;
     if (pendingPayload == volatilePayload) volatilePayload = "";
     else if (!outbox.acknowledge()) { Serial.println("ERROR: ACK cursor not saved; will replay"); return; }
-    Serial.println("Server ACK received; record synchronized");
+    Serial.printf("Server ACK received; record synchronized session=%s seq=%lu\n",
+      data["sessionId"] | "-", data["sequenceNumber"] | 0UL);
     pendingPayload = ""; lastTransmit = millis() - 15000;
   } else if (kind == "command") {
     String newMode = data["mode"] | "", command = data["command"] | "";
@@ -208,6 +210,7 @@ void onRadioPacket(const String& payload) {
 }
 void setup() {
   Serial.begin(115200);
+  Serial.println("Node firmware: telemetry TX diagnostics enabled");
   // Set the output latch before enabling the driver so the relay starts off.
   gpio_set_level(static_cast<gpio_num_t>(RELAY_PIN), RELAY_OFF_LEVEL);
   pinMode(RELAY_PIN, OUTPUT);
@@ -248,6 +251,16 @@ void setup() {
   lastSensor = lastSample = millis(); lastTransmit = millis() - RETRY_INTERVAL;
   Serial.printf("LuxMap node %s session=%s\n", DEVICE_ID, sessionId.c_str());
 }
+
+void logTelemetryQueued(const String& payload) {
+  JsonDocument data;
+  deserializeJson(data, payload);
+  Serial.printf("Telemetry queued for LoRa session=%s seq=%lu source=%s AUX=%s\n",
+    data["sessionId"] | "-",
+    data["sequenceNumber"] | 0UL, payload == volatilePayload ? "RAM" : "SD",
+    radio.auxHigh() ? "HIGH" : "LOW");
+}
+
 void loop() {
   radio.poll();
   if (!radio.busy() && !commandAck.isEmpty() && radio.sendJson(commandAck, true)) {
@@ -271,8 +284,16 @@ void loop() {
       if (!outbox.peek(pendingPayload)) pendingPayload = volatilePayload;
     }
     if (!pendingPayload.isEmpty() && radio.sendJson(pendingPayload)) {
+      logTelemetryQueued(pendingPayload);
       lastTransmit = now; retryDelay = RETRY_INTERVAL + esp_random() % 3000;
     }
+  }
+  static unsigned long lastRadioReport = 0;
+  if (now - lastRadioReport >= 5000) {
+    lastRadioReport = now;
+    Serial.printf("LoRa TX status AUX=%s busy=%s telemetry_pending_bytes=%u\n",
+      radio.auxHigh() ? "HIGH" : "LOW", radio.busy() ? "yes" : "no",
+      static_cast<unsigned>(pendingPayload.length()));
   }
   delay(2);
 }

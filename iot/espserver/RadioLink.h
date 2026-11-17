@@ -38,6 +38,7 @@ class RadioLink {
     Serial2.begin(9600, SERIAL_8N1, 16, 17);
   }
   bool busy() const { return outgoing.length() != 0; }
+  uint32_t rxByteCount() const { return receivedBytes; }
   bool sendJson(const String& json, bool control = false) {
     if (busy() || json.length() + 7 > MAX_FRAME) return false;
     outgoing = frame(json);
@@ -49,6 +50,7 @@ class RadioLink {
   void poll() {
     while (Serial2.available()) {
       char c = Serial2.read();
+      ++receivedBytes;
       if (c == '@') { incoming = "@"; receiving = true; }
       else if (receiving && c == '\n') {
         String payload;
@@ -77,6 +79,7 @@ class RadioLink {
   void (*callback)(const String&) = nullptr;
   String incoming, outgoing;
   bool receiving = false;
+  uint32_t receivedBytes = 0;
   size_t offset = 0, burstSize = 48;
   unsigned long lastChunk = 0, lastReceive = 0;
 };

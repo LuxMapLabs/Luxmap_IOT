@@ -33,16 +33,19 @@ class RadioLink {
   }
   void begin(void (*handler)(const String&)) {
     callback = handler;
-    pinMode(4, INPUT_PULLUP);  // E32 AUX -> GPIO4
+    pinMode(AUX_PIN, INPUT_PULLUP);
     Serial2.setRxBufferSize(2048);
     Serial2.begin(9600, SERIAL_8N1, 16, 17);
   }
   bool busy() const { return outgoing.length() != 0; }
+  bool auxHigh() const { return digitalRead(AUX_PIN) == HIGH; }
   bool sendJson(const String& json, bool control = false) {
     if (busy() || json.length() + 7 > MAX_FRAME) return false;
     outgoing = frame(json);
     burstSize = control && outgoing.length() <= CONTROL_BURST_LIMIT ? CONTROL_BURST_LIMIT : 48;
     offset = 0;
+    frameBytesWritten = 0;
+    controlFrame = control;
     lastChunk = millis() - CHUNK_INTERVAL_MS;
     return true;
   }
@@ -65,18 +68,24 @@ class RadioLink {
       incoming = ""; receiving = false;
       Serial.println("LoRa: incomplete frame timed out");
     }
-    if (!busy() || digitalRead(4) == LOW || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
+    if (!busy() || !auxHigh() || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
     if (offset >= outgoing.length()) { outgoing = ""; return; }
     if (offset == 0 && receiving) return;
     size_t count = outgoing.length() - offset;
     if (count > burstSize) count = burstSize;
-    Serial2.write(reinterpret_cast<const uint8_t*>(outgoing.c_str() + offset), count);
+    frameBytesWritten += Serial2.write(reinterpret_cast<const uint8_t*>(outgoing.c_str() + offset), count);
     offset += count; lastChunk = millis();
+    if (offset == outgoing.length()) {
+      Serial.printf("LoRa UART %s frame: wrote %u/%u bytes, AUX=%s\n",
+        controlFrame ? "control" : "telemetry", static_cast<unsigned>(frameBytesWritten),
+        static_cast<unsigned>(outgoing.length()), auxHigh() ? "HIGH" : "LOW");
+    }
   }
  private:
+  static constexpr int AUX_PIN = 4;  // E32 AUX -> GPIO4
   void (*callback)(const String&) = nullptr;
   String incoming, outgoing;
-  bool receiving = false;
-  size_t offset = 0, burstSize = 48;
+  bool receiving = false, controlFrame = false;
+  size_t offset = 0, burstSize = 48, frameBytesWritten = 0;
   unsigned long lastChunk = 0, lastReceive = 0;
 };
