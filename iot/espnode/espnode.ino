@@ -28,6 +28,7 @@ bool electricalSampleValid = false, luxSampleValid = false;
 bool lampIsOn = false, manualOn = false;
 int dayStartMinute = AutoLighting::DayStartMinute;
 int nightStartMinute = AutoLighting::NightStartMinute;
+String autoType = "scheduled";
 String mode = "AUTO", appliedCommandId = "", sessionId;
 uint64_t appliedVersion = 0;
 uint32_t sequenceNumber = 0;
@@ -93,11 +94,15 @@ AutoLighting::ConsecutiveSamples autoSamples;
 
 void controlLamp(bool freshSample) {
   if (mode == "MANUAL") { autoSamples.reset(); setLamp(manualOn); return; }
-  if (!rtcTimeValid) { autoSamples.reset(); return; }
-  const DateTime now = rtc.now();
-  if (!now.isValid()) { autoSamples.reset(); return; }
-  const int minutes = now.hour() * 60 + now.minute();
-  if (!AutoLighting::isDay(minutes, dayStartMinute, nightStartMinute)) {
+  const bool fullTime = autoType == "full_time";
+  int minutes = 0;
+  if (!fullTime) {
+    if (!rtcTimeValid) { autoSamples.reset(); return; }
+    const DateTime now = rtc.now();
+    if (!now.isValid()) { autoSamples.reset(); return; }
+    minutes = now.hour() * 60 + now.minute();
+  }
+  if (!AutoLighting::useSensor(fullTime, rtcTimeValid, minutes, dayStartMinute, nightStartMinute)) {
     autoSamples.reset();
     setLamp(true);
   } else if (freshSample) {
@@ -138,6 +143,7 @@ void captureTelemetry() {
   data["kind"] = "telemetry"; data["deviceId"] = DEVICE_ID;
   data["sessionId"] = sessionId; data["sequenceNumber"] = ++sequenceNumber;
   data["mode"] = mode; data["lampCommand"] = lampIsOn ? "ON" : "OFF";
+  if (mode == "AUTO") data["autoType"] = autoType;
   data["lux"] = luxValue; data["voltage"] = voltageValue;
   data["current"] = currentValue; data["power"] = powerValue;
   data["appliedCommandId"] = appliedCommandId;
@@ -165,6 +171,9 @@ void onRadioPacket(const String& payload) {
   } else if (kind == "command") {
     String newMode = data["mode"] | "", command = data["command"] | "";
     String id = data["commandId"] | "";
+    const String newAutoType = data["autoType"] | "scheduled";
+    if ((newMode == "AUTO" && newAutoType != "scheduled" && newAutoType != "full_time") ||
+        (newMode == "MANUAL" && !data["autoType"].isNull())) return;
     uint64_t version = data["version"] | uint64_t(0);
     if (id.isEmpty() || (newMode != "AUTO" && newMode != "MANUAL") ||
         (newMode == "MANUAL" && command != "ON" && command != "OFF")) return;
@@ -186,17 +195,21 @@ void onRadioPacket(const String& payload) {
       JsonVariantConst schedule = data["autoSchedule"].as<JsonVariantConst>();
       int day = schedule["dayStartMinute"] | -1;
       int night = schedule["nightStartMinute"] | -1;
+      if (newAutoType == "full_time" && !schedule.isNull()) return;
       if (!schedule.isNull() && (day < 0 || day >= 1440 || night < 0 || night >= 1440 || day == night)) return;
-      if (schedule.isNull()) {
+      if (schedule.isNull() && newAutoType != "full_time") {
         data["autoSchedule"]["dayStartMinute"] = dayStartMinute;
         data["autoSchedule"]["nightStartMinute"] = nightStartMinute;
       }
+      if (newMode == "AUTO") data["autoType"] = newAutoType;
+      else data.remove("autoType");
       String saved; serializeJson(data, saved);
       if (!controlsReady || controls.putString("command", saved) != saved.length()) {
         Serial.println("ERROR: cannot persist command; no command ACK"); return;
       }
       dayStartMinute = data["autoSchedule"]["dayStartMinute"] | AutoLighting::DayStartMinute;
       nightStartMinute = data["autoSchedule"]["nightStartMinute"] | AutoLighting::NightStartMinute;
+      autoType = newAutoType;
       mode = newMode; manualOn = command == "ON"; appliedCommandId = id; appliedVersion = version;
       autoSamples.reset();
       controlLamp(false);
@@ -205,6 +218,7 @@ void onRadioPacket(const String& payload) {
     JsonDocument ack;
     ack["kind"] = "commandAck"; ack["deviceId"] = DEVICE_ID; ack["commandId"] = appliedCommandId;
     ack["mode"] = mode; ack["lampCommand"] = lampIsOn ? "ON" : "OFF";
+    if (mode == "AUTO") ack["autoType"] = autoType;
     commandAck = ""; serializeJson(ack, commandAck);
   }
 }
@@ -222,6 +236,8 @@ void setup() {
     if (!deserializeJson(saved, controls.getString("command", ""))) {
       String restored = saved["mode"] | "AUTO";
       if (restored == "AUTO" || restored == "MANUAL") {
+        autoType = saved["autoType"] | "scheduled";
+        if (autoType != "scheduled" && autoType != "full_time") autoType = "scheduled";
         mode = restored; manualOn = String(saved["command"] | "") == "ON";
         appliedCommandId = saved["commandId"] | ""; appliedVersion = saved["version"] | uint64_t(0);
         dayStartMinute = saved["autoSchedule"]["dayStartMinute"] | AutoLighting::DayStartMinute;

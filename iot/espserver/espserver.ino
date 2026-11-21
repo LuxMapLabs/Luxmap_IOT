@@ -26,6 +26,7 @@ constexpr unsigned long NODE_SYNC_INTERVAL_MS = 10000;
 struct NodeState {
   String id;
   String desiredCommand, desiredCommandId, acknowledgedCommandId, telemetryAck, commandAck;
+  String desiredMode, desiredAutoType;
   uint64_t desiredVersion = 0;
   unsigned long lastCommandTransmit = 0, lastCommandAckPublish = 0;
   unsigned long commandRetryDelay = COMMAND_RETRY_MIN_MS;
@@ -132,12 +133,24 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
     serializeJson(data, node->telemetryAck);
   } else if (topic(node->id, "command") == incomingTopic && String(data["kind"] | "") == "command") {
     const String id = data["commandId"] | "";
+    const String requestedMode = data["mode"] | "";
+    const String requestedType = data["autoType"] | "scheduled";
+    if (requestedMode == "AUTO") {
+      if (requestedType != "scheduled" && requestedType != "full_time") return;
+      if (requestedType == "full_time" && !data["autoSchedule"].isNull()) return;
+      data["autoType"] = requestedType;
+    } else if (requestedMode == "MANUAL") {
+      if (!data["autoType"].isNull()) return;
+      data.remove("autoType");
+    } else return;
     const uint64_t version = data["version"] | uint64_t(0);
     if (id.isEmpty() || (!node->desiredCommand.isEmpty() && version < node->desiredVersion)) return;
     if (node->desiredCommandId != id) {
       node->commandAck = "";
       node->acknowledgedCommandId = "";
       node->desiredCommandId = id;
+      node->desiredMode = requestedMode;
+      node->desiredAutoType = requestedMode == "AUTO" ? requestedType : "";
       node->desiredVersion = version;
       node->expiresAtUnixSeconds = data["expiresAtUnixSeconds"] | uint64_t(0);
       if (data["autoSchedule"].isNull()) data.remove("autoSchedule");
@@ -177,6 +190,8 @@ void onRadioPacket(const String& payload) {
       logTelemetry("MQTT publish failed", data);
   } else if (kind == "commandAck" && !node->desiredCommandId.isEmpty() &&
              String(data["commandId"] | "") == node->desiredCommandId) {
+    if (String(data["mode"] | "") != node->desiredMode ||
+        (node->desiredMode == "AUTO" && String(data["autoType"] | "scheduled") != node->desiredAutoType)) return;
     node->acknowledgedCommandId = node->desiredCommandId;
     node->commandAck = payload;
     node->lastCommandAckPublish = millis() - 5000;
