@@ -26,6 +26,7 @@ constexpr unsigned long NODE_SYNC_INTERVAL_MS = 10000;
 struct NodeState {
   String id;
   String desiredCommand, desiredCommandId, acknowledgedCommandId, telemetryAck, sensorHealthAck, commandAck;
+  String desiredMode, desiredAutoType;
   uint64_t desiredVersion = 0;
   unsigned long lastCommandTransmit = 0, lastCommandAckPublish = 0;
   unsigned long commandRetryDelay = COMMAND_RETRY_MIN_MS;
@@ -138,12 +139,24 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
     serializeJson(data, ack);
   } else if (kind == "command" && topic(node->id, "command") == incomingTopic) {
     const String id = data["commandId"] | "";
+    const String requestedMode = data["mode"] | "";
+    const String requestedType = data["autoType"] | "scheduled";
+    if (requestedMode == "AUTO") {
+      if (requestedType != "scheduled" && requestedType != "full_time") return;
+      if (requestedType == "full_time" && !data["autoSchedule"].isNull()) return;
+      data["autoType"] = requestedType;
+    } else if (requestedMode == "MANUAL") {
+      if (!data["autoType"].isNull()) return;
+      data.remove("autoType");
+    } else return;
     const uint64_t version = data["version"] | uint64_t(0);
     if (id.isEmpty() || (!node->desiredCommand.isEmpty() && version < node->desiredVersion)) return;
     if (node->desiredCommandId != id) {
       node->commandAck = "";
       node->acknowledgedCommandId = "";
       node->desiredCommandId = id;
+      node->desiredMode = requestedMode;
+      node->desiredAutoType = requestedMode == "AUTO" ? requestedType : "";
       node->desiredVersion = version;
       node->expiresAtUnixSeconds = data["expiresAtUnixSeconds"] | uint64_t(0);
       if (data["autoSchedule"].isNull()) data.remove("autoSchedule");
@@ -182,8 +195,13 @@ void onRadioPacket(const String& payload) {
       logTelemetry("MQTT published", data);
     else
       logTelemetry("MQTT publish failed", data);
+  } else if (kind == "commandAck" && String(data["commandId"] | "") != node->desiredCommandId) {
+    // An older command may have executed before its deadline. Bridge validates its durable ledger.
+    if (mqtt.connected()) mqtt.publish(topic(node->id, "commandAck").c_str(), payload.c_str(), false);
   } else if (kind == "commandAck" && !node->desiredCommandId.isEmpty() &&
              String(data["commandId"] | "") == node->desiredCommandId) {
+    if (String(data["mode"] | "") != node->desiredMode ||
+        (node->desiredMode == "AUTO" && String(data["autoType"] | "scheduled") != node->desiredAutoType)) return;
     node->acknowledgedCommandId = node->desiredCommandId;
     node->commandAck = payload;
     node->lastCommandAckPublish = millis() - 5000;
@@ -291,7 +309,7 @@ void setup() {
   mqtt.setCallback(onMqttMessage); mqtt.setKeepAlive(15); mqtt.setSocketTimeout(1);
   if (!mqtt.setBufferSize(2560)) Serial.println("ERROR: MQTT buffer allocation failed");
   startNetworkConfiguration();
-  Serial.printf("LuxMap LoRa gateway %s\n", serverId.c_str());
+  Serial.printf("LuxMap LoRa gateway %s firmware=gateway-auto-type-v2\n", serverId.c_str());
 }
 
 void publishCommandAck() {
@@ -332,7 +350,10 @@ void sendPendingRadio() {
     auto& node = nodes[index];
     if (node.desiredCommand.isEmpty() || node.desiredCommandId == node.acknowledgedCommandId ||
         now - node.lastCommandTransmit < node.commandRetryDelay) continue;
-    if (node.expiresAtUnixSeconds && static_cast<uint64_t>(time(nullptr)) >= node.expiresAtUnixSeconds) continue;
+    if (node.expiresAtUnixSeconds && static_cast<uint64_t>(time(nullptr)) >= node.expiresAtUnixSeconds) {
+      node.desiredCommand = ""; // Keep the ID so an execution receipt may still arrive late.
+      continue;
+    }
     if (radio.sendJson(node.desiredCommand, true)) {
       if (commandsSinceTelemetryAck < 2) ++commandsSinceTelemetryAck;
       radioCursor = (index + 1) % nodes.size();
