@@ -7,6 +7,9 @@ class RadioLink {
  public:
   static const size_t MAX_FRAME = 768;
   static constexpr size_t CONTROL_BURST_LIMIT = 256;
+  static constexpr size_t WHOLE_FRAME_LIMIT = 480; // Same conservative bound as espnode.
+  static constexpr unsigned long ACK_LISTEN_MS = 1500;
+  static constexpr unsigned long RX_TURNAROUND_MS = 80;
   static constexpr unsigned long CHUNK_INTERVAL_MS = 300;
   static constexpr unsigned long RX_IDLE_TIMEOUT_MS = 2500;
   static uint16_t crc(const String& data) {
@@ -40,9 +43,13 @@ class RadioLink {
   bool busy() const { return outgoing.length() != 0; }
   uint32_t rxByteCount() const { return receivedBytes; }
   bool sendJson(const String& json, bool control = false) {
-    if (busy() || json.length() + 7 > MAX_FRAME) return false;
+    if (busy() || digitalRead(4) == LOW || receiving || Serial2.available() ||
+        (hasTransmitted && millis() - transmissionFinishedAt < ACK_LISTEN_MS) ||
+        (receivedBytes != 0 && millis() - lastReceive < RX_TURNAROUND_MS) ||
+        json.length() + 7 > MAX_FRAME) return false;
     outgoing = frame(json);
-    burstSize = control && outgoing.length() <= CONTROL_BURST_LIMIT ? CONTROL_BURST_LIMIT : 48;
+    burstSize = outgoing.length() <= WHOLE_FRAME_LIMIT ? WHOLE_FRAME_LIMIT : 128;
+    (void)control; // Commands and ACKs use the same bounded complete-frame fast path.
     offset = 0;
     lastChunk = millis() - CHUNK_INTERVAL_MS;
     return true;
@@ -68,7 +75,12 @@ class RadioLink {
       Serial.println("LoRa: incomplete frame timed out");
     }
     if (!busy() || digitalRead(4) == LOW || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
-    if (offset >= outgoing.length()) { outgoing = ""; return; }
+    if (offset >= outgoing.length()) {
+      outgoing = "";
+      transmissionFinishedAt = millis();
+      hasTransmitted = true;
+      return;
+    }
     if (offset == 0 && receiving) return;
     size_t count = outgoing.length() - offset;
     if (count > burstSize) count = burstSize;
@@ -78,8 +90,8 @@ class RadioLink {
  private:
   void (*callback)(const String&) = nullptr;
   String incoming, outgoing;
-  bool receiving = false;
+  bool receiving = false, hasTransmitted = false;
   uint32_t receivedBytes = 0;
   size_t offset = 0, burstSize = 48;
-  unsigned long lastChunk = 0, lastReceive = 0;
+  unsigned long lastChunk = 0, lastReceive = 0, transmissionFinishedAt = 0;
 };

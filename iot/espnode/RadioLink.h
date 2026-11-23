@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "NodeLog.h"
 
 // E32 transparent UART, 9600 8N1; M0/M1 must be tied LOW on both modules.
 // Application framing: @JSON*CRC16\n. Short control frames fit in one E32 UART burst.
@@ -7,6 +8,10 @@ class RadioLink {
  public:
   static const size_t MAX_FRAME = 768;
   static constexpr size_t CONTROL_BURST_LIMIT = 256;
+  static constexpr size_t DATA_BURST_LIMIT = 128;
+  // E32-433T20D has a 512-byte UART buffer. A complete frame below this
+  // conservative bound avoids artificial gaps between its JSON fragments.
+  static constexpr size_t WHOLE_FRAME_LIMIT = 480;
   static constexpr unsigned long CHUNK_INTERVAL_MS = 300;
   static constexpr unsigned long RX_IDLE_TIMEOUT_MS = 2500;
   static uint16_t crc(const String& data) {
@@ -39,10 +44,16 @@ class RadioLink {
   }
   bool busy() const { return outgoing.length() != 0; }
   bool auxHigh() const { return digitalRead(AUX_PIN) == HIGH; }
+  bool quietFor(unsigned long duration) const {
+    return quiet && idle() && millis() - quietSince >= duration;
+  }
+  uint32_t receiveErrorCount() const { return receiveErrors; }
   bool sendJson(const String& json, bool control = false) {
     if (busy() || json.length() + 7 > MAX_FRAME) return false;
+    quiet = false;
     outgoing = frame(json);
-    burstSize = control && outgoing.length() <= CONTROL_BURST_LIMIT ? CONTROL_BURST_LIMIT : 48;
+    burstSize = control && outgoing.length() <= CONTROL_BURST_LIMIT ? CONTROL_BURST_LIMIT :
+      outgoing.length() <= WHOLE_FRAME_LIMIT ? WHOLE_FRAME_LIMIT : DATA_BURST_LIMIT;
     offset = 0;
     frameBytesWritten = 0;
     controlFrame = control;
@@ -50,23 +61,30 @@ class RadioLink {
     return true;
   }
   void poll() {
+    if (!idle()) quiet = false;
     while (Serial2.available()) {
+      quiet = false;
       char c = Serial2.read();
       if (c == '@') { incoming = "@"; receiving = true; }
       else if (receiving && c == '\n') {
         String payload;
         if (decode(incoming, payload) && callback) callback(payload);
-        else Serial.println("LoRa: rejected bad CRC/frame");
+        else { ++receiveErrors; NodeLog::debugln("LoRa: rejected bad CRC/frame"); }
         incoming = ""; receiving = false;
       } else if (receiving && c != '\r') {
         if (incoming.length() < MAX_FRAME) incoming += c;
-        else { incoming = ""; receiving = false; }
+        else { ++receiveErrors; incoming = ""; receiving = false; }
       }
       lastReceive = millis();
     }
     if (receiving && millis() - lastReceive > RX_IDLE_TIMEOUT_MS) {
       incoming = ""; receiving = false;
-      Serial.println("LoRa: incomplete frame timed out");
+      ++receiveErrors;
+      NodeLog::debugln("LoRa: incomplete frame timed out");
+    }
+    if (idle() && !quiet) {
+      quietSince = millis();
+      quiet = true;
     }
     if (!busy() || !auxHigh() || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
     if (offset >= outgoing.length()) { outgoing = ""; return; }
@@ -76,16 +94,18 @@ class RadioLink {
     frameBytesWritten += Serial2.write(reinterpret_cast<const uint8_t*>(outgoing.c_str() + offset), count);
     offset += count; lastChunk = millis();
     if (offset == outgoing.length()) {
-      Serial.printf("LoRa UART %s frame: wrote %u/%u bytes, AUX=%s\n",
+      NodeLog::debugf("LoRa UART %s frame: wrote %u/%u bytes, AUX=%s\n",
         controlFrame ? "control" : "telemetry", static_cast<unsigned>(frameBytesWritten),
         static_cast<unsigned>(outgoing.length()), auxHigh() ? "HIGH" : "LOW");
     }
   }
  private:
   static constexpr int AUX_PIN = 4;  // E32 AUX -> GPIO4
+  bool idle() const { return auxHigh() && !busy() && !receiving && !Serial2.available(); }
   void (*callback)(const String&) = nullptr;
   String incoming, outgoing;
-  bool receiving = false, controlFrame = false;
+  bool receiving = false, controlFrame = false, quiet = false;
+  uint32_t receiveErrors = 0;
   size_t offset = 0, burstSize = 48, frameBytesWritten = 0;
-  unsigned long lastChunk = 0, lastReceive = 0;
+  unsigned long lastChunk = 0, lastReceive = 0, quietSince = 0;
 };

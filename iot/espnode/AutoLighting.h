@@ -13,6 +13,10 @@ constexpr bool isDay(int minuteOfDay, int dayStart, int nightStart) {
     : minuteOfDay >= dayStart || minuteOfDay < nightStart;
 }
 
+constexpr bool useSensor(bool fullTime, bool rtcValid, int minute, int dayStart, int nightStart) {
+  return fullTime || (rtcValid && isDay(minute, dayStart, nightStart));
+}
+
 class ConsecutiveSamples {
  public:
   void reset() { count = 0; }

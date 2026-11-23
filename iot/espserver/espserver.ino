@@ -25,7 +25,8 @@ constexpr unsigned long NODE_SYNC_INTERVAL_MS = 10000;
 
 struct NodeState {
   String id;
-  String desiredCommand, desiredCommandId, acknowledgedCommandId, telemetryAck, commandAck;
+  String desiredCommand, desiredCommandId, acknowledgedCommandId, telemetryAck, sensorHealthAck, commandAck;
+  String desiredMode, desiredAutoType;
   uint64_t desiredVersion = 0;
   unsigned long lastCommandTransmit = 0, lastCommandAckPublish = 0;
   unsigned long commandRetryDelay = COMMAND_RETRY_MIN_MS;
@@ -44,12 +45,13 @@ unsigned long lastMqttAttempt = 0, lastHeartbeat = 0, lastNodeRequest = 0;
 bool heartbeatSent = false, nodeListReceived = false;
 
 String topic(const String& id, const char* kind) { return String("luxmap/") + id + "/" + kind; }
-String gatewayTopic(const char* kind) { return String("luxmap/gateways/") + gatewayId + "/" + kind; }
+String gatewayTopic(const char* kind) { return String("luxmap/gateways/") + serverId + "/" + kind; }
 
 void logTelemetry(const char* stage, const JsonDocument& data) {
   const char* deviceId = data["deviceId"] | "";
   const char* sessionId = data["sessionId"] | "";
-  Serial.printf("Telemetry %s device=%s session=%s seq=%lu\n", stage,
+  const String kind = data["kind"] | "";
+  Serial.printf("%s %s device=%s session=%s seq=%lu\n", kind.startsWith("sensorHealth") ? "Sensor health" : "Telemetry", stage,
     validMqttId(deviceId) ? deviceId : "-", validMqttId(sessionId) ? sessionId : "-",
     data["sequenceNumber"] | 0UL);
 }
@@ -62,6 +64,7 @@ NodeState* findNode(const String& id) {
 }
 
 void receiveNodeList(const JsonDocument& data) {
+  if (String(data["serverId"] | serverId.c_str()) != serverId) return;
   JsonArrayConst ids = data["deviceIds"].as<JsonArrayConst>();
   if (ids.isNull() || ids.size() > MAX_NODES) return;
   std::vector<String> next;
@@ -85,7 +88,8 @@ void subscribeNodes() {
         if (node.id == id) retained = true;
       if (!retained && node.subscribed &&
           (!mqtt.unsubscribe(topic(node.id, "command").c_str()) ||
-           !mqtt.unsubscribe(topic(node.id, "telemetryAck").c_str()))) {
+           !mqtt.unsubscribe(topic(node.id, "telemetryAck").c_str()) ||
+           !mqtt.unsubscribe(topic(node.id, "sensorHealthAck").c_str()))) {
         mqtt.disconnect();
         return;
       }
@@ -109,7 +113,8 @@ void subscribeNodes() {
   for (auto& node : nodes) {
     if (node.subscribed) continue;
     if (!mqtt.subscribe(topic(node.id, "command").c_str(), 1) ||
-        !mqtt.subscribe(topic(node.id, "telemetryAck").c_str(), 1)) {
+        !mqtt.subscribe(topic(node.id, "telemetryAck").c_str(), 1) ||
+        !mqtt.subscribe(topic(node.id, "sensorHealthAck").c_str(), 1)) {
       mqtt.disconnect();
       return;
     }
@@ -126,18 +131,32 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
   }
   auto* node = findNode(data["deviceId"] | "");
   if (!node) return;
-  if (topic(node->id, "telemetryAck") == incomingTopic && String(data["kind"] | "") == "telemetryAck") {
+  const String kind = data["kind"] | "";
+  if ((kind == "telemetryAck" || kind == "sensorHealthAck") && topic(node->id, kind.c_str()) == incomingTopic) {
     logTelemetry("MQTT ACK received", data);
-    node->telemetryAck = "";
-    serializeJson(data, node->telemetryAck);
-  } else if (topic(node->id, "command") == incomingTopic && String(data["kind"] | "") == "command") {
+    String& ack = kind == "sensorHealthAck" ? node->sensorHealthAck : node->telemetryAck;
+    ack = "";
+    serializeJson(data, ack);
+  } else if (kind == "command" && topic(node->id, "command") == incomingTopic) {
     const String id = data["commandId"] | "";
+    const String requestedMode = data["mode"] | "";
+    const String requestedType = data["autoType"] | "scheduled";
+    if (requestedMode == "AUTO") {
+      if (requestedType != "scheduled" && requestedType != "full_time") return;
+      if (requestedType == "full_time" && !data["autoSchedule"].isNull()) return;
+      data["autoType"] = requestedType;
+    } else if (requestedMode == "MANUAL") {
+      if (!data["autoType"].isNull()) return;
+      data.remove("autoType");
+    } else return;
     const uint64_t version = data["version"] | uint64_t(0);
     if (id.isEmpty() || (!node->desiredCommand.isEmpty() && version < node->desiredVersion)) return;
     if (node->desiredCommandId != id) {
       node->commandAck = "";
       node->acknowledgedCommandId = "";
       node->desiredCommandId = id;
+      node->desiredMode = requestedMode;
+      node->desiredAutoType = requestedMode == "AUTO" ? requestedType : "";
       node->desiredVersion = version;
       node->expiresAtUnixSeconds = data["expiresAtUnixSeconds"] | uint64_t(0);
       if (data["autoSchedule"].isNull()) data.remove("autoSchedule");
@@ -159,24 +178,30 @@ void onRadioPacket(const String& payload) {
     return;
   }
   const String kind = data["kind"] | "";
-  if (kind == "telemetry") logTelemetry("LoRa received", data);
+  const bool report = kind == "telemetry" || kind == "sensorHealth";
+  if (report) logTelemetry("LoRa received", data);
   auto* node = findNode(data["deviceId"] | "");
   if (!node) {
-    if (kind == "telemetry") logTelemetry("blocked: device not in gateway list", data);
+    if (report) logTelemetry("blocked: device not in gateway list", data);
     return;
   }
-  if (kind == "telemetry") {
+  if (report) {
     // Only the bridge's durable-storage ACK is relayed to the node.
     if (!mqtt.connected())
       logTelemetry("blocked: MQTT disconnected", data);
     else if (!nodeListReceived)
       logTelemetry("blocked: MQTT node list not synced", data);
-    else if (mqtt.publish(topic(node->id, "telemetry").c_str(), payload.c_str(), false))
+    else if (mqtt.publish(topic(node->id, kind.c_str()).c_str(), payload.c_str(), false))
       logTelemetry("MQTT published", data);
     else
       logTelemetry("MQTT publish failed", data);
+  } else if (kind == "commandAck" && String(data["commandId"] | "") != node->desiredCommandId) {
+    // An older command may have executed before its deadline. Bridge validates its durable ledger.
+    if (mqtt.connected()) mqtt.publish(topic(node->id, "commandAck").c_str(), payload.c_str(), false);
   } else if (kind == "commandAck" && !node->desiredCommandId.isEmpty() &&
              String(data["commandId"] | "") == node->desiredCommandId) {
+    if (String(data["mode"] | "") != node->desiredMode ||
+        (node->desiredMode == "AUTO" && String(data["autoType"] | "scheduled") != node->desiredAutoType)) return;
     node->acknowledgedCommandId = node->desiredCommandId;
     node->commandAck = payload;
     node->lastCommandAckPublish = millis() - 5000;
@@ -191,8 +216,7 @@ void maintainMqtt() {
   else if (configuredSsid.isEmpty()) blocked = "Wi-Fi SSID missing";
   else if (WiFi.status() != WL_CONNECTED) blocked = "Wi-Fi not connected";
   else if (!validBrokerAddress(configuredBroker)) blocked = "broker URL must use mqtts://";
-  else if (!validMqttId(gatewayId) || mqttUsername != gatewayId ||
-           !validMqttSecret(mqttSecret)) blocked = "invalid gateway ID, username or secret format";
+  else if (!validMqttId(serverId) || !validMqttSecret(mqttSecret)) blocked = "invalid server ID or secret format";
   if (blocked) {
     if (mqtt.connected()) mqtt.disconnect();
     mqttNetwork.stop();
@@ -234,7 +258,7 @@ void maintainMqtt() {
         mqttHost.c_str(), static_cast<unsigned int>(brokerPort), code, reason);
       mqttNetwork.stop(); return;
     }
-    if (!mqtt.connect(gatewayId.c_str(), mqttUsername.c_str(), mqttSecret.c_str())) {
+    if (!mqtt.connect(serverId.c_str(), serverId.c_str(), mqttSecret.c_str())) {
       mqttNetwork.stop(); Serial.printf("MQTT failed state=%d\n", mqtt.state()); return;
     }
     nodeListReceived = false;
@@ -265,7 +289,7 @@ void maintainMqtt() {
     const String heartbeatTopic = gatewayTopic("heartbeat");
     if (mqtt.publish(heartbeatTopic.c_str(), "1", false)) {
       lastHeartbeat = now;
-      if (!heartbeatSent) Serial.printf("MQTT heartbeat sent: %s\n", gatewayId.c_str());
+      if (!heartbeatSent) Serial.printf("MQTT heartbeat sent: %s\n", serverId.c_str());
       heartbeatSent = true;
     }
   }
@@ -285,7 +309,7 @@ void setup() {
   mqtt.setCallback(onMqttMessage); mqtt.setKeepAlive(15); mqtt.setSocketTimeout(1);
   if (!mqtt.setBufferSize(2560)) Serial.println("ERROR: MQTT buffer allocation failed");
   startNetworkConfiguration();
-  Serial.printf("LuxMap LoRa gateway %s\n", gatewayId.c_str());
+  Serial.printf("LuxMap LoRa gateway %s firmware=gateway-auto-type-v2\n", serverId.c_str());
 }
 
 void publishCommandAck() {
@@ -305,10 +329,12 @@ bool sendTelemetryAck() {
   for (size_t offset = 0; offset < nodes.size(); ++offset) {
     const size_t index = (radioCursor + offset) % nodes.size();
     auto& node = nodes[index];
-    if (node.telemetryAck.isEmpty()) continue;
-    if (!radio.sendJson(node.telemetryAck)) return false;
-    Serial.printf("Telemetry LoRa ACK queued device=%s\n", node.id.c_str());
-    node.telemetryAck = "";
+    const bool healthAckWaiting = !node.sensorHealthAck.isEmpty();
+    String& ack = healthAckWaiting ? node.sensorHealthAck : node.telemetryAck;
+    if (ack.isEmpty()) continue;
+    if (!radio.sendJson(ack)) return false;
+    Serial.printf("%s LoRa ACK queued device=%s\n", healthAckWaiting ? "Sensor health" : "Telemetry", node.id.c_str());
+    ack = "";
     radioCursor = (index + 1) % nodes.size();
     commandsSinceTelemetryAck = 0;
     return true;
@@ -324,7 +350,10 @@ void sendPendingRadio() {
     auto& node = nodes[index];
     if (node.desiredCommand.isEmpty() || node.desiredCommandId == node.acknowledgedCommandId ||
         now - node.lastCommandTransmit < node.commandRetryDelay) continue;
-    if (node.expiresAtUnixSeconds && static_cast<uint64_t>(time(nullptr)) >= node.expiresAtUnixSeconds) continue;
+    if (node.expiresAtUnixSeconds && static_cast<uint64_t>(time(nullptr)) >= node.expiresAtUnixSeconds) {
+      node.desiredCommand = ""; // Keep the ID so an execution receipt may still arrive late.
+      continue;
+    }
     if (radio.sendJson(node.desiredCommand, true)) {
       if (commandsSinceTelemetryAck < 2) ++commandsSinceTelemetryAck;
       radioCursor = (index + 1) % nodes.size();

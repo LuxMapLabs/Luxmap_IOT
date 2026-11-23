@@ -12,7 +12,8 @@ WebServer configWeb(80);
 String configuredSsid;
 String configuredPassword;
 String configuredBroker;
-String gatewayId, mqttUsername, mqttSecret;
+String serverId, mqttSecret;
+bool legacyIdentityConfiguration = false;
 unsigned long configVersion = 0;
 bool networkApplyPending = false;
 unsigned long networkSavedAt = 0;
@@ -49,6 +50,8 @@ button{background:#145ac8;color:white;border:0;border-radius:8px;margin-top:24px
   page += WiFi.status() == WL_CONNECTED
     ? String("Đã kết nối Wi-Fi. IP ESP32: ") + WiFi.localIP().toString()
     : String("Chưa kết nối Wi-Fi. Kiểm tra tên mạng và mật khẩu.");
+  if (legacyIdentityConfiguration)
+    page += "</p><p>Đang dùng danh tính gateway cũ. Khi chuyển sang server_id, hãy nhập mã và MQTT key mới do Admin cấp.";
   page += R"HTML(</p><form method="post" action="/save">
 <label>Tên Wi-Fi (SSID)<input name="ssid" maxlength="32" required value=")HTML";
   page += escapeConfigHtml(configuredSsid);
@@ -58,12 +61,10 @@ button{background:#145ac8;color:white;border:0;border-radius:8px;margin-top:24px
 <label>Địa chỉ MQTT broker<input name="server" type="text" maxlength="200" required placeholder="mqtts://luxmap.com.vn:8883" value=")HTML";
   page += escapeConfigHtml(configuredBroker);
   page += R"HTML("></label><small>Nhập mqtts://luxmap.com.vn:8883, không thêm /api.</small>
-<label>Gateway ID<input name="gateway" maxlength="64" required value=")HTML";
-  page += escapeConfigHtml(gatewayId);
-  page += R"HTML("></label><label>MQTT username<input name="user" maxlength="64" required value=")HTML";
-  page += escapeConfigHtml(mqttUsername);
-  page += R"HTML("></label><label>MQTT secret<input name="secret" type="password" maxlength="64" autocomplete="new-password"></label>
-<small>Để trống để giữ secret nếu broker, Gateway ID và username giữ nguyên.</small>
+<label>Server ID<input name="server_id" maxlength="64" required value=")HTML";
+  page += escapeConfigHtml(serverId);
+  page += R"HTML("></label><small>Nhập server_id trên LuxMap (ví dụ iot-server-01). MQTT Client ID và username tự dùng cùng mã này.</small><label>MQTT secret<input name="secret" type="password" maxlength="64" autocomplete="new-password"></label>
+<small>Để trống để giữ secret nếu broker và Server ID giữ nguyên. Khi đổi mã phải nhập key của mã mới.</small>
 <button>Lưu và kết nối</button></form><p>Cấu hình vẫn được giữ sau khi tắt nguồn.</p></main></body></html>)HTML";
   configWeb.sendHeader("Cache-Control", "no-store");
   configWeb.send(200, "text/html; charset=utf-8", page);
@@ -100,6 +101,13 @@ bool validMqttId(const String& id) {
   return true;
 }
 
+bool validServerIdentity(const String& id) {
+  if (!validMqttId(id) || id == "default") return false;
+  for (unsigned int i = 0; i < id.length(); ++i)
+    if (id[i] >= 'A' && id[i] <= 'Z') return false;
+  return true;
+}
+
 bool validMqttSecret(const String& secret) {
   if (secret.length() != 64) return false;
   for (unsigned int i = 0; i < secret.length(); ++i)
@@ -114,14 +122,14 @@ void saveNetworkConfiguration() {
   String server = configWeb.arg("server");
   server.trim();
   while (server.endsWith("/")) server.remove(server.length() - 1);
-  String gateway = configWeb.arg("gateway");
-  String user = configWeb.arg("user");
+  String identity = configWeb.arg("server_id");
+  identity.trim();
   String secret = configWeb.arg("secret");
-  if (secret.isEmpty() && server == configuredBroker && gateway == gatewayId && user == mqttUsername)
+  if (secret.isEmpty() && server == configuredBroker && identity == serverId)
     secret = mqttSecret;
-  if (!validMqttId(gateway) || user != gateway || !validMqttSecret(secret)) {
+  if (!validServerIdentity(identity) || !validMqttSecret(secret)) {
     configWeb.send(400, "text/plain; charset=utf-8",
-      "Cần Gateway ID, username trùng Gateway ID và secret MQTT 64 ký tự hex.");
+      "Cần server_id chữ thường trùng mã LuxMap và secret MQTT của mã đó (64 ký tự hex).");
     return;
   }
   bool openNetwork = configWeb.arg("open") == "1";
@@ -140,8 +148,7 @@ void saveNetworkConfiguration() {
   config["ssid"] = ssid;
   config["password"] = password;
   config["broker"] = server;
-  config["gateway"] = gateway;
-  config["mqtt_user"] = user;
+  config["server_id"] = identity;
   config["mqtt_secret"] = secret;
   String encoded;
   serializeJson(config, encoded);
@@ -160,8 +167,8 @@ void saveNetworkConfiguration() {
   configuredSsid = ssid;
   configuredPassword = password;
   configuredBroker = server;
-  gatewayId = gateway;
-  mqttUsername = user;
+  serverId = identity;
+  legacyIdentityConfiguration = false;
   mqttSecret = secret;
   ++configVersion;
   networkSavedAt = millis();
@@ -184,8 +191,9 @@ void startNetworkConfiguration() {
       configuredSsid = config["ssid"] | "";
       configuredPassword = config["password"] | "";
       configuredBroker = config["broker"] | "";
-      gatewayId = config["gateway"] | "";
-      mqttUsername = config["mqtt_user"] | "";
+      // Read old NVS without changing or lowercasing an existing MQTT identity/key.
+      legacyIdentityConfiguration = config["server_id"].isNull();
+      serverId = legacyIdentityConfiguration ? String(config["gateway"] | "") : String(config["server_id"] | "");
       mqttSecret = config["mqtt_secret"] | "";
       // Keep the old address in the form so changing broker still requires its secret.
     }
