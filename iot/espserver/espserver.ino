@@ -179,6 +179,14 @@ void onRadioPacket(const String& payload) {
   }
   const String kind = data["kind"] | "";
   const bool report = kind == "telemetry" || kind == "sensorHealth";
+  // Preserve the node's explicit live/backfill marker; never infer it from network delay.
+  if (kind == "telemetry" && !data["receptionType"].isNull()) {
+    const String reception = data["receptionType"].as<String>();
+    if (reception != "live" && reception != "backfill") {
+      Serial.println("LoRa telemetry rejected: invalid receptionType");
+      return;
+    }
+  }
   if (report) logTelemetry("LoRa received", data);
   auto* node = findNode(data["deviceId"] | "");
   if (!node) {

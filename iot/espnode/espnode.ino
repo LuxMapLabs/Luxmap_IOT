@@ -16,7 +16,7 @@
 const char* DEVICE_ID = "LUXMAP-P001";
 const int RELAY_PIN = 27;
 const int RELAY_ON_LEVEL = HIGH, RELAY_OFF_LEVEL = LOW;
-const unsigned long SENSOR_INTERVAL = 1000, SAMPLE_INTERVAL = 10000, RETRY_INTERVAL = 10000;
+const unsigned long SENSOR_INTERVAL = 1000, SAMPLE_INTERVAL = 1000, RETRY_INTERVAL = 3000;
 constexpr uint8_t INA226_ADDRESS = 0x40;
 constexpr float INA226_SHUNT_OHMS = 0.002f; // R002 on this module.
 // Continuous 1 Hz reads are selected for the user's capacitor observation.
@@ -59,9 +59,9 @@ String pendingPayload, volatilePayload, commandAck;
 String latestLivePayload, livePendingPayload, lastLiveAckTimestamp;
 bool preferLive = true;
 uint32_t liveFramesQueued = 0, liveAcksReceived = 0;
-// Reserve two real electrical measurements between data frames. Command ACKs
+// Reserve one real electrical measurement between data frames. Command ACKs
 // bypass this gate; inbound commands are always polled.
-constexpr uint8_t MEASUREMENTS_PER_DATA_FRAME = 2;
+constexpr uint8_t MEASUREMENTS_PER_DATA_FRAME = 1;
 uint8_t measurementsSinceDataFrame = 0;
 uint32_t telemetryFramesQueued = 0, telemetryAcksReceived = 0;
 uint32_t commandPacketsReceived = 0, commandAcksQueued = 0, healthAcksReceived = 0;
@@ -243,6 +243,7 @@ void captureTelemetry() {
   data["lux"] = luxValue; data["voltage"] = voltageValue;
   data["current"] = currentValue; data["power"] = powerValue;
   data["appliedCommandId"] = appliedCommandId;
+  data["captureUptime"] = millis();
   char sampledAt[20] = "";
   DateTime measuredTime(2000, 1, 1);
   if (readRtcClock(measuredTime) == SensorIssue::None) {
@@ -292,7 +293,7 @@ bool sendSensorHealth(unsigned long now) {
     JsonDocument report;
     report["kind"] = "sensorHealth"; report["deviceId"] = DEVICE_ID;
     report["sessionId"] = sessionId; report["sequenceNumber"] = ++sensorHealthSequence;
-    report["firmwareVersion"] = "fast-v11-auto-type";
+    report["firmwareVersion"] = "fast-v12-1hz-replay";
     JsonArray codes = report["codes"].to<JsonArray>();
     for (const auto* fault : { &rtcFault, &inaFault, &luxFault })
       if (fault->active != SensorIssue::None) codes.add(sensorIssueCode(fault->active));
@@ -368,6 +369,7 @@ void onRadioPacket(const String& payload) {
     if (fifoAck) {
       if (pendingPayload == volatilePayload) volatilePayload = "";
       else if (!outbox.acknowledge()) return; // Keep retrying if durable cursor save fails.
+      if (latestLivePayload == pendingPayload) latestLivePayload = "";
       pendingPayload = "";
     }
     if (liveAck) {
@@ -381,7 +383,8 @@ void onRadioPacket(const String& payload) {
     }
     ++telemetryAcksReceived;
     lastTelemetryAck = millis();
-    lastTransmit = lastTelemetryAck - 15000;
+    retryDelay = 1000;
+    lastTransmit = lastTelemetryAck - retryDelay;
   } else if (kind == "command") {
     ++commandPacketsReceived;
     String newMode = data["mode"] | "", command = data["command"] | "";
@@ -531,6 +534,10 @@ String telemetryForRadio(const String& storedPayload) {
   // The command ACK carries commandId separately. This optional duplicate field
   // is unused by telemetry ingest; keep the original SD record unchanged.
   data.remove("appliedCommandId");
+  const bool fresh = String(data["sessionId"] | "") == sessionId &&
+    !data["captureUptime"].isNull() && millis() - data["captureUptime"].as<unsigned long>() <= 2500;
+  data["receptionType"] = fresh ? "live" : "backfill";
+  data.remove("captureUptime");
   // Wire precision remains finer than the meter's resolution and matches Serial.
   for (const char* name : { "lux", "voltage", "current", "power" }) {
     if (data[name].isNull()) continue;
@@ -605,7 +612,7 @@ void loop() {
       ++telemetryFramesQueued;
       measurementsSinceDataFrame = 0;
       logTelemetryQueued(selected);
-      lastTransmit = now; retryDelay = RETRY_INTERVAL + esp_random() % 3000;
+      lastTransmit = now; retryDelay = RETRY_INTERVAL + esp_random() % 250;
     }
   }
   static unsigned long lastRadioReport = 0;
