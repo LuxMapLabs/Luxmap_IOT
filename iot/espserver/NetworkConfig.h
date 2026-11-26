@@ -2,6 +2,7 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <esp_system.h>
@@ -9,6 +10,7 @@
 // Built into the Arduino ESP32 core; no WiFiManager library required.
 String configPassword;
 WebServer configWeb(80);
+DNSServer configDns;
 String configuredSsid;
 String configuredPassword;
 String configuredBroker;
@@ -35,6 +37,35 @@ bool authorizeConfiguration() {
   if (configWeb.authenticate("admin", configPassword.c_str())) return true;
   configWeb.requestAuthentication();
   return false;
+}
+
+// Keep the discovery page accessible to captive-portal browsers. Credentials
+// and saved settings are only exposed by the authenticated /configure handler.
+void showConfigurationPortal() {
+  if (configWeb.client().localIP() != WiFi.softAPIP()) {
+    configWeb.send(403, "text/plain", "Connect to the gateway setup Wi-Fi.");
+    return;
+  }
+  const String address = String("http://") + WiFi.softAPIP().toString() + "/configure";
+  configWeb.sendHeader("Cache-Control", "no-store");
+  configWeb.send(200, "text/html; charset=utf-8",
+    String("<!doctype html><html lang=\"vi\"><head><meta charset=\"utf-8\">"
+      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+      "<title>Cấu hình LuxMap Gateway</title></head><body>"
+      "<h1>Cấu hình LuxMap Gateway</h1><p><a href=\"") + address +
+      "\">Mở trang cấu hình Wi-Fi và MQTT</a></p>"
+      "<p>Đăng nhập bằng tài khoản admin và mật khẩu Wi-Fi cấu hình của gateway.</p>"
+      "</body></html>");
+}
+
+void redirectToConfigurationPortal() {
+  if (configWeb.client().localIP() != WiFi.softAPIP()) {
+    configWeb.send(403, "text/plain", "Connect to the gateway setup Wi-Fi.");
+    return;
+  }
+  configWeb.sendHeader("Cache-Control", "no-store");
+  configWeb.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/");
+  configWeb.send(302, "text/plain", "Open the LuxMap gateway configuration page.");
 }
 
 void showNetworkConfiguration() {
@@ -217,11 +248,23 @@ void startNetworkConfiguration() {
   }
   String apName = String("LUXMAP-GATEWAY-") + WiFi.macAddress().substring(12);
   apName.replace(":", "");
-  if (!WiFi.softAP(apName.c_str(), configPassword.c_str()))
+  if (!WiFi.softAP(apName.c_str(), configPassword.c_str())) {
     Serial.println("ERROR: cannot start configuration WiFi");
-  configWeb.on("/", HTTP_GET, showNetworkConfiguration);
+  } else {
+    // Advertise the setup link through DHCP and answer portal-detection DNS.
+    if (!WiFi.AP.enableDhcpCaptivePortal())
+      Serial.println("WARNING: cannot advertise configuration link through DHCP");
+    if (!configDns.start(53, "*", WiFi.softAPIP()))
+      Serial.println("WARNING: cannot start captive portal DNS");
+  }
+  configWeb.on("/", HTTP_GET, showConfigurationPortal);
+  configWeb.on("/configure", HTTP_GET, showNetworkConfiguration);
   configWeb.on("/save", HTTP_POST, saveNetworkConfiguration);
-  configWeb.onNotFound([]() { configWeb.send(404, "text/plain", "Not found"); });
+  // Android, Apple and Windows HTTP connectivity probes arrive at different paths.
+  configWeb.onNotFound([]() {
+    if (configWeb.method() == HTTP_GET) redirectToConfigurationPortal();
+    else configWeb.send(404, "text/plain", "Not found");
+  });
   configWeb.begin();
   Serial.print("Configuration WiFi: "); Serial.println(apName);
   Serial.print("Configuration page: http://"); Serial.println(WiFi.softAPIP());
@@ -231,6 +274,7 @@ void startNetworkConfiguration() {
 }
 
 void handleNetworkConfiguration() {
+  configDns.processNextRequest();
   configWeb.handleClient();
   // Send the HTTP response before changing the station connection.
   if (networkApplyPending && millis() - networkSavedAt >= 500) {

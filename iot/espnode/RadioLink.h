@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "NodeLog.h"
+#include "RadioStall.h"
 
 // E32 transparent UART, 9600 8N1; M0/M1 must be tied LOW on both modules.
 // Application framing: @JSON*CRC16\n. Short control frames fit in one E32 UART burst.
@@ -48,6 +49,9 @@ class RadioLink {
     return quiet && idle() && millis() - quietSince >= duration;
   }
   uint32_t receiveErrorCount() const { return receiveErrors; }
+  bool transmitBlocked() const { return stall.isBlocked(); }
+  uint32_t stallCount() const { return stall.eventCount(); }
+  uint32_t maximumAuxWaitMs() const { return stall.maximumWaitMs(); }
   bool sendJson(const String& json, bool control = false) {
     if (busy() || json.length() + 7 > MAX_FRAME) return false;
     quiet = false;
@@ -65,6 +69,7 @@ class RadioLink {
     while (Serial2.available()) {
       quiet = false;
       char c = Serial2.read();
+      ++uartProgress;
       if (c == '@') { incoming = "@"; receiving = true; }
       else if (receiving && c == '\n') {
         String payload;
@@ -77,6 +82,7 @@ class RadioLink {
       }
       lastReceive = millis();
     }
+    stall.observe(millis(), auxHigh(), uartProgress);
     if (receiving && millis() - lastReceive > RX_IDLE_TIMEOUT_MS) {
       incoming = ""; receiving = false;
       ++receiveErrors;
@@ -86,12 +92,15 @@ class RadioLink {
       quietSince = millis();
       quiet = true;
     }
-    if (!busy() || !auxHigh() || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
+    if (!busy() || !auxHigh()) return;
     if (offset >= outgoing.length()) { outgoing = ""; return; }
+    if (millis() - lastChunk < CHUNK_INTERVAL_MS) return;
     if (offset == 0 && receiving) return;
     size_t count = outgoing.length() - offset;
     if (count > burstSize) count = burstSize;
-    frameBytesWritten += Serial2.write(reinterpret_cast<const uint8_t*>(outgoing.c_str() + offset), count);
+    const size_t written = Serial2.write(reinterpret_cast<const uint8_t*>(outgoing.c_str() + offset), count);
+    frameBytesWritten += written;
+    uartProgress += written;
     offset += count; lastChunk = millis();
     if (offset == outgoing.length()) {
       NodeLog::debugf("LoRa UART %s frame: wrote %u/%u bytes, AUX=%s\n",
@@ -106,6 +115,8 @@ class RadioLink {
   String incoming, outgoing;
   bool receiving = false, controlFrame = false, quiet = false;
   uint32_t receiveErrors = 0;
+  uint32_t uartProgress = 0;
+  RadioStall stall;
   size_t offset = 0, burstSize = 48, frameBytesWritten = 0;
   unsigned long lastChunk = 0, lastReceive = 0, quietSince = 0;
 };
