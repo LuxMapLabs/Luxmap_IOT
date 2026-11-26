@@ -8,6 +8,8 @@
 #include <esp_system.h>
 #include "NetworkConfig.h"
 #include "RadioLink.h"
+#include "TelemetryWire.h"
+#include "TelemetryBatch.h"
 #include "src/PubSubClient/PubSubClient.h"
 
 WiFiClientSecure mqttNetwork;
@@ -33,6 +35,10 @@ struct NodeState {
   unsigned long commandQueuedAt = 0;
   uint64_t expiresAtUnixSeconds = 0;
   bool subscribed = false;
+  bool compactTelemetry = false;
+  bool batchTelemetry = false;
+  JsonDocument batchAcks;
+  unsigned long batchAckQueuedAt = 0;
 };
 
 std::vector<NodeState> nodes;
@@ -134,7 +140,22 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
   const String kind = data["kind"] | "";
   if ((kind == "telemetryAck" || kind == "sensorHealthAck") && topic(node->id, kind.c_str()) == incomingTopic) {
     logTelemetry("MQTT ACK received", data);
+    if (kind == "telemetryAck" && node->batchTelemetry) {
+      JsonArray queued = node->batchAcks.is<JsonArray>() ? node->batchAcks.as<JsonArray>() : node->batchAcks.to<JsonArray>();
+      for (JsonObjectConst ack : queued)
+        if (String(ack["s"] | "") == String(data["sessionId"] | "") &&
+            ack["q"].as<uint32_t>() == data["sequenceNumber"].as<uint32_t>()) return;
+      if (queued.size() >= 8) { Serial.println("Telemetry ACK queue full; node will retry retained samples"); return; }
+      if (queued.size() == 0) node->batchAckQueuedAt = millis();
+      JsonObject ack = queued.add<JsonObject>();
+      ack["s"] = data["sessionId"]; ack["q"] = data["sequenceNumber"];
+      return;
+    }
     String& ack = kind == "sensorHealthAck" ? node->sensorHealthAck : node->telemetryAck;
+    // Advertise capability only on an ACK actually received from durable storage.
+    data["wireVersion"] = 2;
+    data["batchVersion"] = 3;
+    if (kind == "telemetryAck" && node->compactTelemetry) TelemetryWire::encode(data);
     ack = "";
     serializeJson(data, ack);
   } else if (kind == "command" && topic(node->id, "command") == incomingTopic) {
@@ -173,7 +194,25 @@ void onMqttMessage(char* incomingTopic, byte* payload, unsigned int length) {
 
 void onRadioPacket(const String& payload) {
   JsonDocument data;
-  if (deserializeJson(data, payload)) {
+  if (deserializeJson(data, payload)) return;
+  if (String(data["w"] | "") == "b3") {
+    JsonDocument samples;
+    auto* node = findNode(data["d"] | "");
+    if (!node || !TelemetryBatch::expand(data, samples)) {
+      Serial.println("LoRa batch rejected: invalid batch or unregistered device"); return;
+    }
+    node->batchTelemetry = true;
+    Serial.printf("LoRa batch received device=%s samples=%u bytes=%u\n", node->id.c_str(),
+      unsigned(samples.size()), unsigned(payload.length()));
+    for (JsonObject sample : samples.as<JsonArray>()) {
+      sample["wireVersion"] = 2;
+      sample["batchVersion"] = 3;
+      String expanded; serializeJson(sample, expanded);
+      onRadioPacket(expanded);
+    }
+    return;
+  }
+  if (!TelemetryWire::decode(data)) {
     Serial.println("LoRa frame rejected: invalid JSON");
     return;
   }
@@ -193,13 +232,21 @@ void onRadioPacket(const String& payload) {
     if (report) logTelemetry("blocked: device not in gateway list", data);
     return;
   }
+  if (kind == "telemetry") {
+    node->compactTelemetry = (data["wireVersion"] | 0) == 2;
+    node->batchTelemetry = (data["batchVersion"] | 0) == 3;
+  }
+  data.remove("wireVersion");
+  data.remove("batchVersion");
+  String mqttPayload;
+  serializeJson(data, mqttPayload);
   if (report) {
     // Only the bridge's durable-storage ACK is relayed to the node.
     if (!mqtt.connected())
       logTelemetry("blocked: MQTT disconnected", data);
     else if (!nodeListReceived)
       logTelemetry("blocked: MQTT node list not synced", data);
-    else if (mqtt.publish(topic(node->id, kind.c_str()).c_str(), payload.c_str(), false))
+    else if (mqtt.publish(topic(node->id, kind.c_str()).c_str(), mqttPayload.c_str(), false))
       logTelemetry("MQTT published", data);
     else
       logTelemetry("MQTT publish failed", data);
@@ -337,6 +384,26 @@ bool sendTelemetryAck() {
   for (size_t offset = 0; offset < nodes.size(); ++offset) {
     const size_t index = (radioCursor + offset) % nodes.size();
     auto& node = nodes[index];
+    JsonArray queued = node.batchAcks.as<JsonArray>();
+    if (!queued.isNull() && queued.size() && millis() - node.batchAckQueuedAt >= 120) {
+      JsonDocument batch;
+      batch["w"] = "k3"; batch["d"] = node.id; batch["s"] = queued[0]["s"];
+      JsonArray ids = batch["q"].to<JsonArray>();
+      for (JsonObjectConst ack : queued) {
+        if (String(ack["s"] | "") == String(batch["s"] | "") && ids.size() < TelemetryBatch::Capacity)
+          ids.add(ack["q"]);
+      }
+      String packet; serializeJson(batch, packet);
+      if (!radio.sendJson(packet)) return false;
+      for (int item = int(queued.size()) - 1; item >= 0; --item) {
+        if (String(queued[item]["s"] | "") != String(batch["s"] | "")) continue;
+        for (JsonVariantConst id : ids)
+          if (id.as<uint32_t>() == queued[item]["q"].as<uint32_t>()) { queued.remove(item); break; }
+      }
+      Serial.printf("Telemetry batch LoRa ACK queued device=%s samples=%u\n", node.id.c_str(), unsigned(ids.size()));
+      radioCursor = (index + 1) % nodes.size(); commandsSinceTelemetryAck = 0;
+      return true;
+    }
     const bool healthAckWaiting = !node.sensorHealthAck.isEmpty();
     String& ack = healthAckWaiting ? node.sensorHealthAck : node.telemetryAck;
     if (ack.isEmpty()) continue;

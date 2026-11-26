@@ -133,6 +133,36 @@ class SdOutbox {
     file.close(); return false;
   }
 
+  // Read ahead without moving the durable cursor. Individual ACKs reclaim FIFO heads.
+  size_t readBatch(String* payloads, size_t capacity) {
+    if (!ready || !capacity) return 0;
+    File file = SD.open("/telemetry.log", FILE_READ);
+    if (!file || !file.seek(cursor)) { readFailed = true; return 0; }
+    size_t count = 0, scanned = 0;
+    String line, firstSession;
+    bool overflow = false;
+    while (file.available() && count < capacity && scanned++ < 4096) {
+      int value = file.read();
+      if (value < 0) { readFailed = true; break; }
+      if (value != '\n') {
+        if (line.length() < RadioLink::MAX_FRAME) line += char(value);
+        else overflow = true;
+        continue;
+      }
+      String decoded;
+      JsonDocument data;
+      if (!overflow && RadioLink::decode(line, decoded) && !deserializeJson(data, decoded)) {
+        const String session = data["sessionId"] | "";
+        if (count && session != firstSession) break;
+        firstSession = session;
+        payloads[count++] = decoded;
+      }
+      line = ""; overflow = false;
+    }
+    file.close();
+    return count;
+  }
+
   // Independent, bounded read-only scan. Never calls peek(), acknowledge(), or writes NVS.
   struct QueueInspection {
     uint32_t samples = 0, invalid = 0;

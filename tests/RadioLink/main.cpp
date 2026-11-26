@@ -29,6 +29,69 @@ int main() {
   // New start delimiter resynchronizes an interrupted frame.
   for (char c : std::string("@partial") + encoded.value) Serial2.rx.push_back(c);
   receiver.poll(); assert(receivedCount == 2);
+  // A normal telemetry frame fits below the E32 UART buffer bound in one write.
+  RadioLink telemetrySender;
+  telemetrySender.begin(capture);
+  const String longTelemetry(std::string(330, 'x'));
+  Serial2.tx.clear();
+  assert(telemetrySender.sendJson(longTelemetry));
+  telemetrySender.poll();
+  assert(Serial2.tx.size() == RadioLink::frame(longTelemetry).length());
+  assert(!telemetrySender.quietFor(1500));
+  for (int i = 0; telemetrySender.busy() && i < 30; ++i) {
+    testTime += RadioLink::CHUNK_INTERVAL_MS;
+    telemetrySender.poll();
+  }
+  assert(!telemetrySender.busy());
+  assert(RadioLink::decode(String(Serial2.tx), decoded));
+  assert(decoded.value == longTelemetry.value);
+  // Larger frames fall back to bounded chunks; never overflow the module buffer.
+  const String largerTelemetry(std::string(600, 'y'));
+  Serial2.tx.clear();
+  assert(telemetrySender.sendJson(largerTelemetry));
+  telemetrySender.poll();
+  assert(Serial2.tx.size() == RadioLink::DATA_BURST_LIMIT);
+  for (int i = 0; telemetrySender.busy() && i < 30; ++i) {
+    testTime += RadioLink::CHUNK_INTERVAL_MS;
+    telemetrySender.poll();
+  }
+  assert(!telemetrySender.busy());
+  assert(RadioLink::decode(String(Serial2.tx), decoded));
+  assert(decoded.value == largerTelemetry.value);
   assert(!sender.sendJson(String(std::string(RadioLink::MAX_FRAME, 'x'))));
-  std::cout << "PASS: actual RadioLink CRC, corruption rejection, AUX gating, chunked send, fragmented receive, resync and buffer bounds\n";
+
+  constexpr unsigned long quietDuration = 500;
+  testTime += quietDuration;
+  assert(receiver.quietFor(quietDuration));
+  auxState = LOW;
+  assert(!receiver.quietFor(quietDuration));
+  receiver.poll();
+  testTime += quietDuration;
+  auxState = HIGH;
+  receiver.poll();
+  assert(!receiver.quietFor(quietDuration));
+  testTime += quietDuration;
+  assert(receiver.quietFor(quietDuration));
+
+  Serial2.rx.push_back('@');
+  assert(!receiver.quietFor(quietDuration));
+  receiver.poll();
+  testTime += quietDuration;
+  receiver.poll();
+  assert(!receiver.quietFor(quietDuration));
+  for (char c : encoded.value.substr(1)) Serial2.rx.push_back(c);
+  receiver.poll();
+  assert(receivedCount == 3 && !receiver.quietFor(quietDuration));
+  testTime += quietDuration;
+  assert(receiver.quietFor(quietDuration));
+
+  assert(receiver.sendJson(json, true) && !receiver.quietFor(quietDuration));
+  receiver.poll();
+  testTime += RadioLink::CHUNK_INTERVAL_MS;
+  receiver.poll();
+  receiver.poll();
+  assert(!receiver.busy() && !receiver.quietFor(quietDuration));
+  testTime += quietDuration;
+  assert(receiver.quietFor(quietDuration));
+  std::cout << "PASS: RadioLink framing, AUX gating, TX/RX and quiet windows\n";
 }

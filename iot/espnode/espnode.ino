@@ -12,6 +12,9 @@
 #include "RadioLink.h"
 #include "SdOutbox.h"
 #include "SensorHealth.h"
+#include "TelemetryWire.h"
+#include "LiveAckCache.h"
+#include "TelemetryBatch.h"
 
 const char* DEVICE_ID = "LUXMAP-P001";
 const int RELAY_PIN = 27;
@@ -55,9 +58,19 @@ unsigned long inaConfiguredAt = 0, relayChangedAt = 0, lastRamSaveAttempt = 0;
 unsigned long lastTelemetryAck = 0, retryDelay = RETRY_INTERVAL;
 unsigned long lastQueueCheck = 0;
 String pendingPayload, volatilePayload, commandAck;
-// Live is a fast copy of an already queued sample. Its ACK NEVER moves the FIFO cursor.
+String lastDataPayload;
+bool telemetryAwaitingAck = false;
+bool healthAwaitingAck = false, batchTelemetry = false, batchIsLive = false;
+String recentPayloads[TelemetryBatch::Capacity], batchPayloads[TelemetryBatch::Capacity];
+size_t recentStart = 0, recentCount = 0, batchCount = 0;
+uint32_t batchesQueued = 0, batchSamplesQueued = 0;
+constexpr unsigned long BATCH_MAX_WAIT_MS = 4000;
+// Live is a fast copy of an already queued sample. Its ACK never skips older FIFO
+// entries; the bounded ACK cache can reclaim that exact copy once it reaches the head.
 String latestLivePayload, livePendingPayload, lastLiveAckTimestamp;
-bool preferLive = true;
+bool compactTelemetry = false;
+LiveAckCache liveAckCache;
+uint8_t liveSinceBacklog = 0;
 uint32_t liveFramesQueued = 0, liveAcksReceived = 0;
 // Reserve one real electrical measurement between data frames. Command ACKs
 // bypass this gate; inbound commands are always polled.
@@ -131,13 +144,20 @@ void handleRtcSerial() {
         (unsigned long)commandPacketsReceived, (unsigned long)commandAcksQueued,
         (unsigned long)healthAcksReceived, (unsigned long)radio.receiveErrorCount(),
         pendingPayload.isEmpty() ? "no" : "yes", radio.auxHigh() ? "HIGH" : "LOW");
+      Serial.printf("RADIO HEALTH tx_blocked=%s stalls=%lu max_aux_wait_ms=%lu threshold_ms=%lu\n",
+        radio.transmitBlocked() ? "yes" : "no", (unsigned long)radio.stallCount(),
+        (unsigned long)radio.maximumAuxWaitMs(), (unsigned long)RadioStall::TimeoutMs);
     }
 
     if (!overflow && strcmp(line, "LIVE STATS") == 0) {
-      Serial.printf("LIVE tx=%lu ack=%lu last_ack_measured_local=%s pending=%s next=%s\n",
+      Serial.printf("LIVE tx=%lu ack=%lu last_ack_measured_local=%s pending=%s next=%s wire=%u\n",
         (unsigned long)liveFramesQueued, (unsigned long)liveAcksReceived,
         lastLiveAckTimestamp.isEmpty() ? "none" : lastLiveAckTimestamp.c_str(),
-        livePendingPayload.isEmpty() ? "no" : "yes", preferLive ? "live" : "backlog");
+        livePendingPayload.isEmpty() ? "no" : "yes",
+        (!livePendingPayload.isEmpty() || liveSinceBacklog < 4 || pendingPayload.isEmpty()) ? "live" : "backlog",
+        compactTelemetry ? 2U : 1U);
+      Serial.printf("BATCH version=%u frames=%lu samples_queued=%lu pending=%u max_samples=4\n",
+        batchTelemetry ? 3U : 0U, (unsigned long)batchesQueued, (unsigned long)batchSamplesQueued, unsigned(batchCount));
     }
     if (!overflow && strcmp(line, "QUEUE GET") == 0) {
       if (outbox.startInspection()) Serial.println("QUEUE GET scanning=read_only snapshot=at_request");
@@ -257,6 +277,10 @@ void captureTelemetry() {
   } else NodeLog::debugf("MicroSD saved seq=%lu timestamp=%s\n", static_cast<unsigned long>(sequenceNumber),
     sampledAt[0] ? sampledAt : "unavailable");
   latestLivePayload = payload;
+  const size_t recentIndex = (recentStart + recentCount) % TelemetryBatch::Capacity;
+  recentPayloads[recentIndex] = payload;
+  if (recentCount < TelemetryBatch::Capacity) ++recentCount;
+  else recentStart = (recentStart + 1) % TelemetryBatch::Capacity;
 }
 
 void sampleElectrical(unsigned long now) {
@@ -293,7 +317,7 @@ bool sendSensorHealth(unsigned long now) {
     JsonDocument report;
     report["kind"] = "sensorHealth"; report["deviceId"] = DEVICE_ID;
     report["sessionId"] = sessionId; report["sequenceNumber"] = ++sensorHealthSequence;
-    report["firmwareVersion"] = "fast-v12-1hz-replay";
+    report["firmwareVersion"] = "fast-v15-batch4-aux10";
     JsonArray codes = report["codes"].to<JsonArray>();
     for (const auto* fault : { &rtcFault, &inaFault, &luxFault })
       if (fault->active != SensorIssue::None) codes.add(sensorIssueCode(fault->active));
@@ -304,6 +328,7 @@ bool sendSensorHealth(unsigned long now) {
     sensorHealthChanged = false;
   }
   if (!pendingSensorHealth.isEmpty() && (newReport || elapsed >= RETRY_INTERVAL) && radio.sendJson(pendingSensorHealth)) {
+    healthAwaitingAck = true;
     lastSensorHealthTransmit = now;
     NodeLog::debugf("Sensor health queued seq=%lu\n", static_cast<unsigned long>(sensorHealthSequence));
     return true;
@@ -316,18 +341,9 @@ void updateHardwareHealth(unsigned long now) {
     outbox.hasWriteError() ? SensorIssue::SdWriteFailed :
     outbox.hasReadError() ? SensorIssue::SdReadFailed : SensorIssue::None;
 
-  static bool waitingForAux = false, txBlocked = false, rxFault = false;
-  static unsigned long auxWaitStarted = 0, lastTxBlocked = 0, lastRxError = 0;
+  static bool rxFault = false;
+  static unsigned long lastRxError = 0;
   static uint32_t previousRxErrors = 0, recentRxErrors = 0;
-  if (radio.busy() && !radio.auxHigh()) {
-    if (!waitingForAux) auxWaitStarted = now;
-    waitingForAux = true;
-    if (now - auxWaitStarted >= RETRY_INTERVAL) {
-      txBlocked = true;
-      lastTxBlocked = now;
-    }
-  } else waitingForAux = false;
-  if (txBlocked && now - lastTxBlocked >= SENSOR_HEALTH_INTERVAL) txBlocked = false;
 
   if (now - lastRxError >= SENSOR_HEALTH_INTERVAL) {
     recentRxErrors = 0;
@@ -340,7 +356,7 @@ void updateHardwareHealth(unsigned long now) {
     lastRxError = now;
     rxFault = recentRxErrors >= 3;
   }
-  const auto link = txBlocked ? SensorIssue::LoraTxBlocked : rxFault ? SensorIssue::LoraRxFrameError : SensorIssue::None;
+  const auto link = radio.transmitBlocked() ? SensorIssue::LoraTxBlocked : rxFault ? SensorIssue::LoraRxFrameError : SensorIssue::None;
   sensorHealthChanged |= storage != sdIssue || link != loraIssue;
   sdIssue = storage;
   loraIssue = link;
@@ -348,11 +364,25 @@ void updateHardwareHealth(unsigned long now) {
 
 void onRadioPacket(const String& payload) {
   JsonDocument data;
-  if (deserializeJson(data, payload) || String(data["deviceId"] | "") != DEVICE_ID) return;
+  if (deserializeJson(data, payload)) return;
+  if (String(data["w"] | "") == "k3") {
+    if (!TelemetryBatch::validAck(data) || String(data["d"] | "") != DEVICE_ID) return;
+    // Reuse the exact per-record ACK path. A partial ACK cannot clear the batch.
+    for (JsonVariantConst sequence : data["q"].as<JsonArrayConst>()) {
+      JsonDocument ack;
+      ack["kind"] = "telemetryAck"; ack["deviceId"] = DEVICE_ID;
+      ack["sessionId"] = data["s"]; ack["sequenceNumber"] = sequence;
+      ack["wireVersion"] = 2; ack["batchVersion"] = 3;
+      String individual; serializeJson(ack, individual); onRadioPacket(individual);
+    }
+    return;
+  }
+  if (!TelemetryWire::decode(data) || String(data["deviceId"] | "") != DEVICE_ID) return;
   String kind = data["kind"] | "";
   if (kind == "sensorHealthAck") {
     if (String(data["sessionId"] | "") == sessionId && data["sequenceNumber"].as<uint32_t>() == sensorHealthSequence) {
       pendingSensorHealth = "";
+      healthAwaitingAck = false;
       ++healthAcksReceived;
       NodeLog::debugf("Sensor health acknowledged seq=%lu\n", static_cast<unsigned long>(sensorHealthSequence));
     }
@@ -360,12 +390,38 @@ void onRadioPacket(const String& payload) {
     auto matches = [&](const String& value) {
       JsonDocument queued;
       return !value.isEmpty() && !deserializeJson(queued, value) &&
-        String(data["sessionId"] | "") == String(queued["sessionId"] | "") &&
-        data["sequenceNumber"].as<uint32_t>() == queued["sequenceNumber"].as<uint32_t>();
+        TelemetryBatch::matchesReceipt(queued, data);
     };
+    for (size_t item = 0; item < batchCount; ++item) {
+      if (!matches(batchPayloads[item])) continue;
+      JsonDocument stored; deserializeJson(stored, batchPayloads[item]);
+      const char* storedSession = stored["sessionId"] | "";
+      if (strlen(storedSession) == 16)
+        liveAckCache.add(strtoull(storedSession, nullptr, 16), stored["sequenceNumber"] | 0UL);
+      if (matches(volatilePayload)) volatilePayload = "";
+      if (matches(latestLivePayload)) latestLivePayload = "";
+      if (batchIsLive) {
+        lastLiveAckTimestamp = String(stored["timestamp"] | "unavailable"); ++liveAcksReceived;
+      }
+      batchPayloads[item] = "";
+      ++telemetryAcksReceived; lastTelemetryAck = millis();
+      bool remaining = false;
+      for (size_t other = 0; other < batchCount; ++other) remaining |= !batchPayloads[other].isEmpty();
+      if (!remaining) {
+        batchCount = 0; telemetryAwaitingAck = false;
+        retryDelay = 1000; lastTransmit = lastTelemetryAck - retryDelay;
+      }
+      return;
+    }
     const bool fifoAck = matches(pendingPayload);
     const bool liveAck = matches(livePendingPayload);
     if (!fifoAck && !liveAck) return;
+    if (matches(lastDataPayload)) {
+      telemetryAwaitingAck = false;
+      lastDataPayload = "";
+    }
+    compactTelemetry = (data["wireVersion"] | 0) == 2;
+    batchTelemetry = (data["batchVersion"] | 0) == 3;
     if (fifoAck) {
       if (pendingPayload == volatilePayload) volatilePayload = "";
       else if (!outbox.acknowledge()) return; // Keep retrying if durable cursor save fails.
@@ -375,6 +431,9 @@ void onRadioPacket(const String& payload) {
     if (liveAck) {
       JsonDocument reading;
       deserializeJson(reading, livePendingPayload);
+      const char* acknowledgedSession = reading["sessionId"] | "";
+      if (strlen(acknowledgedSession) == 16)
+        liveAckCache.add(strtoull(acknowledgedSession, nullptr, 16), reading["sequenceNumber"] | 0UL);
       lastLiveAckTimestamp = String(reading["timestamp"] | "unavailable");
       ++liveAcksReceived;
       if (latestLivePayload == livePendingPayload) latestLivePayload = "";
@@ -535,7 +594,8 @@ String telemetryForRadio(const String& storedPayload) {
   // is unused by telemetry ingest; keep the original SD record unchanged.
   data.remove("appliedCommandId");
   const bool fresh = String(data["sessionId"] | "") == sessionId &&
-    !data["captureUptime"].isNull() && millis() - data["captureUptime"].as<unsigned long>() <= 2500;
+    !data["captureUptime"].isNull() && millis() - data["captureUptime"].as<unsigned long>() <=
+      (batchTelemetry ? BATCH_MAX_WAIT_MS + SENSOR_INTERVAL : 2500);
   data["receptionType"] = fresh ? "live" : "backfill";
   data.remove("captureUptime");
   // Wire precision remains finer than the meter's resolution and matches Serial.
@@ -544,9 +604,67 @@ String telemetryForRadio(const String& storedPayload) {
     const double value = data[name].as<double>();
     if (isfinite(value)) data[name] = round(value * 1000.0) / 1000.0;
   }
+  if (compactTelemetry) TelemetryWire::encode(data);
   String payload;
   serializeJson(data, payload);
   return payload;
+}
+
+bool alreadyStored(const String& payload) {
+  JsonDocument data;
+  if (deserializeJson(data, payload)) return false;
+  const char* session = data["sessionId"] | "";
+  return strlen(session) == 16 && liveAckCache.contains(strtoull(session, nullptr, 16), data["sequenceNumber"] | 0UL);
+}
+
+bool sendDataBatch(unsigned long now) {
+  if (!batchCount) {
+    String candidates[TelemetryBatch::Capacity];
+    size_t available = 0;
+    batchIsLive = liveSinceBacklog < 4 || pendingPayload.isEmpty();
+    if (batchIsLive) {
+      for (size_t i = 0; i < recentCount; ++i) {
+        const String& sample = recentPayloads[(recentStart + i) % TelemetryBatch::Capacity];
+        if (!sample.isEmpty() && !alreadyStored(sample)) candidates[available++] = sample;
+      }
+      if (!available) return false;
+      JsonDocument oldest; deserializeJson(oldest, candidates[0]);
+      if (available < TelemetryBatch::Capacity &&
+          now - (oldest["captureUptime"] | now) < BATCH_MAX_WAIT_MS) return false;
+    } else {
+      available = outbox.readBatch(candidates, TelemetryBatch::Capacity);
+      if (!available && !volatilePayload.isEmpty()) candidates[available++] = volatilePayload;
+    }
+    JsonDocument packet;
+    for (size_t i = 0; i < available; ++i) {
+      if (alreadyStored(candidates[i])) continue;
+      JsonDocument sample;
+      if (deserializeJson(sample, telemetryForRadio(candidates[i])) || !TelemetryWire::decode(sample)) continue;
+      if (!batchCount) TelemetryBatch::begin(packet, DEVICE_ID, sample["sessionId"] | "");
+      if (!TelemetryBatch::append(packet, sample)) break;
+      batchPayloads[batchCount++] = candidates[i];
+    }
+    if (!batchCount) return false;
+    if (batchIsLive) { if (liveSinceBacklog < 4) ++liveSinceBacklog; }
+    else liveSinceBacklog = 0;
+  }
+  JsonDocument packet;
+  size_t sampleCount = 0;
+  for (size_t i = 0; i < batchCount; ++i) {
+    if (batchPayloads[i].isEmpty()) continue;
+    JsonDocument sample;
+    if (deserializeJson(sample, telemetryForRadio(batchPayloads[i])) || !TelemetryWire::decode(sample)) return false;
+    if (!sampleCount) TelemetryBatch::begin(packet, DEVICE_ID, sample["sessionId"] | "");
+    if (!TelemetryBatch::append(packet, sample)) return false;
+    ++sampleCount;
+  }
+  String payload; serializeJson(packet, payload);
+  if (!sampleCount || !radio.sendJson(payload)) return false;
+  ++batchesQueued; batchSamplesQueued += sampleCount; ++telemetryFramesQueued;
+  if (batchIsLive) ++liveFramesQueued;
+  telemetryAwaitingAck = true; measurementsSinceDataFrame = 0;
+  lastTransmit = now; retryDelay = RETRY_INTERVAL + esp_random() % 250;
+  return true;
 }
 
 void loop() {
@@ -589,30 +707,53 @@ void loop() {
   }
   updateHardwareHealth(now);
   // Keep data frames paced without making electrical reads wait for radio ACKs.
-  const bool canStartDataFrame = !radioTransmitPaused && measurementsSinceDataFrame >= MEASUREMENTS_PER_DATA_FRAME &&
+  const bool canStartDataFrame = !radioTransmitPaused && radio.quietFor(80) &&
+    (!healthAwaitingAck || radio.quietFor(TELEMETRY_ACK_LISTEN_MS)) && measurementsSinceDataFrame >= MEASUREMENTS_PER_DATA_FRAME &&
     now - lastElectricalSample < SENSOR_INTERVAL && commandAck.isEmpty();
   // Give the gateway time to return the telemetry ACK on the half-duplex radio.
   if (canStartDataFrame && !radio.busy() &&
-      (pendingPayload.isEmpty() || radio.quietFor(TELEMETRY_ACK_LISTEN_MS)) && sendSensorHealth(now))
+      (!telemetryAwaitingAck || radio.quietFor(TELEMETRY_ACK_LISTEN_MS)) && sendSensorHealth(now))
     measurementsSinceDataFrame = 0;
   if (canStartDataFrame && measurementsSinceDataFrame >= MEASUREMENTS_PER_DATA_FRAME &&
-      !radio.busy() && now - lastTransmit >= retryDelay) {
+      !radio.busy() && now - lastTransmit >= retryDelay &&
+      (!telemetryAwaitingAck || radio.quietFor(TELEMETRY_ACK_LISTEN_MS))) {
     if (pendingPayload.isEmpty() && now - lastQueueCheck >= 1000) {
       lastQueueCheck = now;
       if (!outbox.peek(pendingPayload)) pendingPayload = volatilePayload;
     }
-    const bool sendLive = !latestLivePayload.isEmpty() && (preferLive || pendingPayload.isEmpty());
-    const String& selected = sendLive ? latestLivePayload : pendingPayload;
+    // Skip a bounded number of already stored live copies without retransmitting.
+    // Cursor advancement remains durable and occurs only for an ACKed sample.
+    for (uint8_t skipped = 0; skipped < 8 && !pendingPayload.isEmpty() && pendingPayload != volatilePayload; ++skipped) {
+      JsonDocument head;
+      if (deserializeJson(head, pendingPayload)) break;
+      const char* headSession = head["sessionId"] | "";
+      if (strlen(headSession) != 16 || !liveAckCache.contains(strtoull(headSession, nullptr, 16), head["sequenceNumber"] | 0UL)) break;
+      if (!outbox.acknowledge()) break;
+      pendingPayload = "";
+      if (!outbox.peek(pendingPayload)) break;
+    }
+    // Keep the in-flight live sample stable until ACK. Reserve one slot in five
+    // for older SD records so live traffic cannot starve recovery indefinitely.
+    if (batchTelemetry) {
+      sendDataBatch(now);
+    } else {
+    const bool sendLive = !livePendingPayload.isEmpty() ||
+      (!latestLivePayload.isEmpty() && (liveSinceBacklog < 4 || pendingPayload.isEmpty()));
+    const String& selected = sendLive ? (livePendingPayload.isEmpty() ? latestLivePayload : livePendingPayload) : pendingPayload;
     if (!selected.isEmpty() && radio.sendJson(telemetryForRadio(selected))) {
+      lastDataPayload = selected;
+      telemetryAwaitingAck = true;
       if (sendLive) {
         livePendingPayload = selected;
         ++liveFramesQueued;
       }
-      preferLive = !sendLive;
+      if (sendLive) { if (liveSinceBacklog < 4) ++liveSinceBacklog; }
+      else liveSinceBacklog = 0;
       ++telemetryFramesQueued;
       measurementsSinceDataFrame = 0;
       logTelemetryQueued(selected);
       lastTransmit = now; retryDelay = RETRY_INTERVAL + esp_random() % 250;
+    }
     }
   }
   static unsigned long lastRadioReport = 0;

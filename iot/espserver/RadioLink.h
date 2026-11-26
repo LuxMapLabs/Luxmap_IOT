@@ -44,12 +44,12 @@ class RadioLink {
   uint32_t rxByteCount() const { return receivedBytes; }
   bool sendJson(const String& json, bool control = false) {
     if (busy() || digitalRead(4) == LOW || receiving || Serial2.available() ||
-        (hasTransmitted && millis() - transmissionFinishedAt < ACK_LISTEN_MS) ||
+        (hasTransmitted && waitForReply && millis() - transmissionFinishedAt < ACK_LISTEN_MS) ||
         (receivedBytes != 0 && millis() - lastReceive < RX_TURNAROUND_MS) ||
         json.length() + 7 > MAX_FRAME) return false;
     outgoing = frame(json);
     burstSize = outgoing.length() <= WHOLE_FRAME_LIMIT ? WHOLE_FRAME_LIMIT : 128;
-    (void)control; // Commands and ACKs use the same bounded complete-frame fast path.
+    waitForReply = control; // Commands need a reply; a telemetry ACK does not need another ACK.
     offset = 0;
     lastChunk = millis() - CHUNK_INTERVAL_MS;
     return true;
@@ -74,13 +74,14 @@ class RadioLink {
       incoming = ""; receiving = false;
       Serial.println("LoRa: incomplete frame timed out");
     }
-    if (!busy() || digitalRead(4) == LOW || millis() - lastChunk < CHUNK_INTERVAL_MS) return;
+    if (!busy() || digitalRead(4) == LOW) return;
     if (offset >= outgoing.length()) {
       outgoing = "";
       transmissionFinishedAt = millis();
       hasTransmitted = true;
       return;
     }
+    if (millis() - lastChunk < CHUNK_INTERVAL_MS) return;
     if (offset == 0 && receiving) return;
     size_t count = outgoing.length() - offset;
     if (count > burstSize) count = burstSize;
@@ -90,7 +91,7 @@ class RadioLink {
  private:
   void (*callback)(const String&) = nullptr;
   String incoming, outgoing;
-  bool receiving = false, hasTransmitted = false;
+  bool receiving = false, hasTransmitted = false, waitForReply = false;
   uint32_t receivedBytes = 0;
   size_t offset = 0, burstSize = 48;
   unsigned long lastChunk = 0, lastReceive = 0, transmissionFinishedAt = 0;

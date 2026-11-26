@@ -42,5 +42,6 @@ struct TestSerial {
   char read() { char c = rx.front(); rx.pop_front(); return c; }
   size_t write(const uint8_t* data, size_t length) { tx.append(reinterpret_cast<const char*>(data), length); return length; }
   void println(const char*) {}
+  void printf(const char*, ...) {}
 };
 inline TestSerial Serial, Serial2;
